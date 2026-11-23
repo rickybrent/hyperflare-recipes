@@ -274,8 +274,8 @@ def test_declared_checkpoints_match_pool_and_page_layouts(alias, raw_factory):
         assert all(view.dtype == torch.float8_e4m3fn for view in views)
         if config.is_sliding(layer):
             assert len(views) == 2
-            assert views[0].shape == (3, PAGE_TOKENS, config.layer_kv_heads(donor), 256)
-            assert views[1].shape == (3, PAGE_TOKENS, config.layer_kv_heads(donor), 256)
+            assert views[0].shape == (2, config.sliding_window, config.layer_kv_heads(donor), 256)
+            assert views[1].shape == (2, config.sliding_window, config.layer_kv_heads(donor), 256)
         else:
             assert len(views) == 3
             assert views[0].shape == (3, PAGE_TOKENS, config.layer_kv_heads(donor), 512)

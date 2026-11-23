@@ -4,6 +4,8 @@
 
 """Gemma 4 Assistant frozen-KV multi-token proposals and stochastic verification."""
 
+from dataclasses import replace
+
 import torch
 
 from hyperflare_recipes.components.collectives import PreparedAllReduce
@@ -137,6 +139,7 @@ class PreparedAssistant:
                     cache_metadata=self.cache_metadata,
                     unit_scale=unit_scale,
                     k_descale=descale,
+                    frozen_kv=True,
                 )
             )
 
@@ -197,6 +200,7 @@ class PreparedAssistant:
         safe_pages = torch.where(active[:, None], pages, -1)
         m = Metadata.pack(starts, lengths, states, safe_pages, tokens[:, None], live_rows,
                           token_capacity=self.batch, sample_count=self.batch)
+        sliding_m = replace(m, starts=before)
         cache_metadata = cache_bindings(m)
         pos = torch.where(m.positions >= 0, m.positions + 1 + step_index, 0).float()[:, None]
         s_freq = pos * self.sliding_inv_freq[None, :]
@@ -209,7 +213,8 @@ class PreparedAssistant:
         hidden = self.pre_projection(torch.cat((token_embed, prev_hidden[m.requests]), dim=-1))
         for layer in self.layers:
             cos, sin = (sliding_cos, sliding_sin) if layer.is_sliding else (full_cos, full_sin)
-            hidden = layer(hidden, cos, sin, metadata=m, cache_metadata=cache_metadata)
+            layer_meta = sliding_m if layer.is_sliding else m
+            hidden = layer(hidden, cos, sin, metadata=layer_meta, cache_metadata=cache_metadata)
         sampled = rms_norm(hidden, self.weights.draft.norm, self.eps)[m.sample_indices]
         projected = self.post_projection(sampled)
         if self.head is not None:
@@ -427,7 +432,7 @@ class PreparedRound:
         candidates[:, 1:].copy_(drafts)
         metadata = Metadata.pack(before, limits, states, pages, candidates, self.inputs.live_rows,
                                  token_capacity=b * w, sample_count=b * w, max_query_tokens=w)
-        hidden, logits, _, _ = self.decoder(metadata)
+        hidden, logits, deferred_sliding, _ = self.decoder(metadata)
         target_scratch = {name: torch.empty(shape, dtype=dtype, device=slots.device)
                           for name, (shape, dtype) in target.layout.items()}
         target.run(target_scratch, logits.view(b, w, -1), candidates=drafts)
@@ -437,6 +442,8 @@ class PreparedRound:
                                 target_scratch["valid"], disjoint=True, drafts=drafts, draft_valid=valid)
         committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=candidates)
         counts = committed.emitted_count
+        if deferred_sliding:
+            self.decoder.commit_sliding(deferred_sliding, metadata, counts)
         selected = hidden.view(b, w, self.hidden)[torch.arange(b, device=slots.device), (counts - 1).long().clamp_min(0)]
         save_hidden(selected, self.pool.last_hidden, metadata.state_rows, counts > 0)
 
