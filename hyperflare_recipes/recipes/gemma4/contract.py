@@ -30,8 +30,47 @@ FRONTEND["reasoning"] = dict(
 )
 
 
-def prepare(signatures, buffers, pool, *, vocabulary, world_size: int = 1, mtp: bool = False):
-    inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()}}
+VISION = dict(
+    features_per_request=4480,
+    max_images=4,
+    patches_per_feature=9,
+    patch_capacities=[630, 1260, 2520, 5040, 10080],
+)
+VISION_FRONTEND = {
+    **FRONTEND,
+    "image_preparation": p.GEMMA4_IMAGE_PREPARATION,
+    "image_layout": p.BRACKETED_IMAGE_LAYOUT,
+    "image_tokens": dict(
+        feature_token=258880,
+        span=dict(
+            start_token=255999,
+            end_token=258882,
+            max_tokens=1122,
+            interior_tokens=[],
+            unscoped_tokens=[],
+        ),
+    ),
+}
+
+
+def prepare(
+    signatures,
+    buffers,
+    pool,
+    *,
+    vocabulary,
+    world_size: int = 1,
+    mtp: bool = False,
+    vision: bool = False,
+    image_slots: int = 0,
+):
+    inputs = {
+        kind: c.text_inputs(kind)
+        for kind in {s.kind for s in signatures.values()}
+        if kind != "vision"
+    }
+    vision_fields = {field for s in signatures.values() if s.kind == "vision" for field in s.inputs}
+    inputs["vision"] = c.vision_inputs(vision_fields) if vision_fields else {}
     if world_size == 1 and "decode" in inputs:
         inputs["decode"].pop("token_ids", None)
     continuation = c.state_view("state_pool", pool.layout.row_bytes)
@@ -60,5 +99,6 @@ def prepare(signatures, buffers, pool, *, vocabulary, world_size: int = 1, mtp: 
             *regions,
         ],
         graphs=c.graph_contracts(signatures, inputs, continuation=continuation, pending=pending, cursor=cursor),
-        frontend=FRONTEND,
+        vision={**VISION, "feature_slots": image_slots} if vision else None,
+        frontend=VISION_FRONTEND if vision else FRONTEND,
     )

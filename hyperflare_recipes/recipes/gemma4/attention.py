@@ -8,6 +8,7 @@ from typing import NamedTuple
 import torch
 
 from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.image_sliding_attention import PreparedImageSlidingAttention
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.parallel import TensorParallelShard
@@ -85,6 +86,7 @@ class PreparedAttention:
         unit_scale: torch.Tensor,
         k_descale: torch.Tensor,
         frozen_kv: bool = False,
+        image_token: int | None = None,
     ):
         self.layer = layer
         self.config = config
@@ -153,6 +155,7 @@ class PreparedAttention:
         self.staged_pages = None
         self.history_key = None
         self.history_value = None
+        self.image_attention = None
         if self.is_sliding:
             history_key, history_value = pool.attention(layer, config, shard=shard)
             self.history_key, self.history_value = history_key, history_value
@@ -199,6 +202,26 @@ class PreparedAttention:
                     k_descale=k_descale,
                     v_descale=unit_scale,
                 )
+                if image_token is not None:
+                    self.image_span_end = zeros("image_span_end", (tokens,), dtype=torch.int32)
+                    self.row_request = zeros("row_request", (tokens,), dtype=torch.int32)
+                    self.image_attention = PreparedImageSlidingAttention(
+                        self.q,
+                        self.staged_key,
+                        self.staged_value,
+                        self.staged_pages,
+                        metadata.positions,
+                        self.image_span_end,
+                        self.row_request,
+                        self.attended.view(tokens, self.heads, self.dim),
+                        window=self.window,
+                        k_descale=k_descale,
+                        v_descale=unit_scale,
+                        session=session,
+                        workspace=workspace,
+                        name=name + ".image_attention",
+                        tuning_page_count=pages,
+                    )
             else:
                 if not self.shared_kv:
                     self.value = zeros("value", (tokens, self.kv_heads, self.dim))
@@ -337,6 +360,8 @@ class PreparedAttention:
                     cache_seqlens=None,
                     cu_seqlens_q=None,
                 )
+        if self.image_attention is not None:
+            self.image_attention = self.image_attention.functional(session=session, k_cache=None, v_cache=None)
         for field in ("attention_lo", "attention_hi"):
             operation = getattr(self, field, None)
             if operation is not None:
@@ -345,11 +370,24 @@ class PreparedAttention:
         for field in ("q_raw", "q_full", "q", "attended", "partial_output", "output", "k_raw", "key",
                       "v_raw", "value", "value_lo", "value_hi", "attended_lo_full", "attended_hi_full",
                       "attended_lo", "attended_hi", "staged_key", "staged_value", "staged_lengths",
-                      "shared_key", "shared_value"):
+                      "shared_key", "shared_value", "image_span_end", "row_request"):
             if hasattr(self, field):
                 setattr(self, field, None)
 
-    def __call__(self, source, cos, sin, *, metadata, cache_metadata, sliding_donor=None, deferred_sliding=None):
+    def __call__(
+        self,
+        source,
+        cos,
+        sin,
+        *,
+        metadata,
+        cache_metadata,
+        sliding_donor=None,
+        deferred_sliding=None,
+        staged_positions=None,
+        image_span_end=None,
+        row_request=None,
+    ):
         tokens = source.shape[0]
         raw = self.q_proj(source)
         q = rms_norm(raw.view(tokens, self.heads, self.dim), self.q_norm, self.eps)
@@ -376,6 +414,17 @@ class PreparedAttention:
                     cache_seqlens=staged_lengths,
                     cu_seqlens_q=metadata.query_start_loc,
                 )
+                if self.image_attention is not None:
+                    attended = self.image_attention(
+                        query,
+                        attended,
+                        k_cache=staged_key,
+                        v_cache=staged_value,
+                        page_table=self.staged_pages,
+                        positions=staged_positions,
+                        image_span_end=image_span_end,
+                        row_request=row_request,
+                    )
                 if not self.shared_kv:
                     commit_circular_kv(key, value, self.history_key, self.history_value, metadata, metadata.lengths)
                 if self.is_sliding_donor and sliding_donor is not None:

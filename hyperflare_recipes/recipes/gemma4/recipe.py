@@ -102,6 +102,8 @@ def prepare(
         retain_graphs=retain_graphs,
         kernel_cache=kernel_cache,
         hub_cache=plan.hub_cache,
+        image_concurrency=plan.image_concurrency,
+        language_model_only=plan.language_model_only,
         **drafting,
     )
     if plan.world_size == 1:
@@ -127,6 +129,9 @@ RECIPE = Recipe(
     served_model_name="Gemma-4",
     prepare=prepare,
     usage=usage,
+    max_images=4,
+    image_bytes=32 << 20,
+    language_model_only=True,
     # Gemma 4 model card sampling recommendations: https://huggingface.co/google/gemma-4-26B-A4B-it.
     sampling_defaults=SamplingDefaults(
         temperature=1.0,
