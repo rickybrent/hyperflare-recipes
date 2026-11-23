@@ -9,6 +9,7 @@ import torch
 
 from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.embedding import PreparedEmbedding
+from hyperflare_recipes.components.image_sliding_attention import compute_image_sliding_spans
 from hyperflare_recipes.components.paged_resume import PreparedResume
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
@@ -87,6 +88,7 @@ class PreparedLayer:
         unit_scale: torch.Tensor,
         k_descale: torch.Tensor,
         frozen_kv: bool = False,
+        image_token: int | None = None,
     ):
         self.index = index
         self.config = config
@@ -125,6 +127,7 @@ class PreparedLayer:
             unit_scale=unit_scale,
             k_descale=k_descale,
             frozen_kv=frozen_kv,
+            image_token=image_token,
         )
 
         self.gate_out = zeros("gate_out", (tokens, inter))
@@ -207,8 +210,21 @@ class PreparedLayer:
             if hasattr(self, field):
                 setattr(self, field, None)
 
-    def __call__(self, hidden_states, cos, sin, ple_input=None, *, metadata, cache_metadata,
-                 sliding_donor=None, deferred_sliding=None):
+    def __call__(
+        self,
+        hidden_states,
+        cos,
+        sin,
+        ple_input=None,
+        *,
+        metadata,
+        cache_metadata,
+        sliding_donor=None,
+        deferred_sliding=None,
+        staged_positions=None,
+        image_span_end=None,
+        row_request=None,
+    ):
         residual = hidden_states
         normalized = rms_norm(residual, self.input_layernorm, self.eps)
         attn_out = self.self_attn(
@@ -219,6 +235,9 @@ class PreparedLayer:
             cache_metadata=cache_metadata,
             sliding_donor=sliding_donor,
             deferred_sliding=deferred_sliding,
+            staged_positions=staged_positions,
+            image_span_end=image_span_end,
+            row_request=row_request,
         )
         hidden_states = residual + rms_norm(attn_out, self.post_attention_layernorm, self.eps)
         residual = hidden_states
@@ -269,6 +288,7 @@ class PreparedDecoder:
         coordinator=None,
         vocabulary_runtime=None,
         scoring=None,
+        vision=None,
     ):
         self.weights = weights
         self.scratch = scratch
@@ -276,6 +296,8 @@ class PreparedDecoder:
         self.pool = pool
         self.mode = mode
         self.auxiliary = None
+        self.vision = vision if mode == "prefill" else None
+        self.image_token = None if self.vision is None else self.vision.image_token
         config = weights.config
         self.config = config
         self.eps = config.rms_norm_eps
@@ -347,6 +369,7 @@ class PreparedDecoder:
                     cache_metadata=self.cache_metadata,
                     unit_scale=unit_scale,
                     k_descale=descale,
+                    image_token=self.image_token,
                 )
             )
 
@@ -400,6 +423,18 @@ class PreparedDecoder:
         full_cos, full_sin = f_emb.cos().bfloat16(), f_emb.sin().bfloat16()
 
         hidden = self.embedding(token_ids=m.token_ids, num_rows=m.live_counts[:1]) * self.embed_scale
+        staged_positions = staged_image_span_end = row_request = None
+        if self.vision is not None:
+            self.vision.inject(m, hidden)
+            image_span_end, row_request = compute_image_sliding_spans(
+                m.token_ids, m.positions, m.query_start_loc, self.image_token
+            )
+            first = (m.starts - self.config.sliding_window).clamp_min(0)
+            row_first = first[row_request.clamp_min(0).long()]
+            staged_positions = torch.where(row_request >= 0, m.positions - row_first, m.positions)
+            staged_image_span_end = torch.where(
+                image_span_end >= 0, (image_span_end.long() - row_first).to(torch.int32), -1
+            )
 
         ple_inputs = None
         if self.ple_embedding is not None:
@@ -428,6 +463,9 @@ class PreparedDecoder:
                 cache_metadata=cache_metadata,
                 sliding_donor=sliding_donor,
                 deferred_sliding=deferred_sliding,
+                staged_positions=staged_positions,
+                image_span_end=staged_image_span_end,
+                row_request=row_request,
             )
 
         normalized = rms_norm(hidden, self.weights.norm, self.eps)

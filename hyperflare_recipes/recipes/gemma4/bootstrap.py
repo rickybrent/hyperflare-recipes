@@ -25,6 +25,7 @@ from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIEL
 from hyperflare_recipes.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from hyperflare_recipes.components.paged_generation import PreparedGeneration
 from hyperflare_recipes.components.paged_maintenance import PreparedMaintenance
+from ignition.components.vision_state import PrefillVisionInputs, VisionState
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.prompt_logprobs import (
     PreparedScoredPrefill,
@@ -54,10 +55,12 @@ from ignition.progress import phase
 
 from .frontend import chat_template_asset
 from .config import PAGE_TOKENS
-from .contract import prepare as prepare_contract
+from .contract import VISION_FRONTEND, prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch, SoftcappedResume
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .speculative import PreparedContext, PreparedRound
+from .vision import PreparedVision, VisionMetadata, VisionScratch
+from .vision_state import FEATURES, PATCH_CAPACITIES, PreparedVisionGeneration, VisionInputs
 from .weights import ModelWeights
 from .recipe import Gemma4Parameters, RECIPE
 from ignition.preparation.bootstrap import BasePreparationConfig
@@ -135,6 +138,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("minimum page capacity must be a positive integer")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
+        if type(self.image_concurrency) is not int or not 0 <= self.image_concurrency <= self.max_active:
+            raise ValueError("Gemma 4 image concurrency must fit the active request capacity")
 
     @property
     def completion_token_capacity(self):
@@ -176,11 +181,16 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
         shard=shard,
         progress=progress,
         draft_checkpoint=draft_checkpoint,
+        language_model_only=config.language_model_only or config.image_concurrency == 0,
     )
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
         release_page_cache(manifest.shard_paths)
+    if weights.vision is not None:
+        needed = VISION_FRONTEND["image_tokens"]["span"]["max_tokens"]
+        if config.prefill_chunk_size < needed:
+            raise ValueError(f"Gemma 4 images need a prefill chunk of at least {needed} tokens")
     drafting = weights.draft is not None
     release_unused()
     effective_context = min(config.context, weights.config.text["max_position_embeddings"])
@@ -269,6 +279,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                     "architecture": weights.config.architecture,
                     "config": weights.config.text,
                     "draft": weights.config.draft.text if drafting else None,
+                    "vision": weights.vision is not None,
                     "headers": [s.header_sha256 for s in manifest.shards],
                     "world_size": shard.world_size,
                     "sliding_storage": "circular",
@@ -311,6 +322,24 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             submission_sequence=sequence,
             **completion.buffers(),
         )
+        vision_state = vision_inputs = vision_prefill = vision_storage = None
+        vision_owners = []
+        if weights.vision is not None:
+            vision_inputs = VisionInputs.allocate(device)
+            vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
+            vision_state = VisionState(
+                inputs,
+                vision_prefill,
+                requests,
+                image_token=VISION_FRONTEND["image_tokens"]["feature_token"],
+                features=FEATURES,
+                hidden=weights.config.hidden,
+                image_slots=config.image_concurrency,
+            )
+            vision_storage = VisionScratch.allocate(
+                max(PATCH_CAPACITIES), device, text_hidden=weights.config.hidden
+            )
+            buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
         speculation = None
         if drafting:
             speculation = SimpleNamespace(
@@ -346,6 +375,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
         len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
         + (len(batch_sizes) if False in modes else 0)
         + len(config.speculative_shapes)
+        + (len(PATCH_CAPACITIES) if weights.vision is not None else 0)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
         def add(name, forward, kind, rows, tokens_count, fields, *, enabled=False):
@@ -355,6 +385,50 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens_count, tuple(fields), speculation_enabled=enabled)
             stage.update(advance=1)
+
+        if weights.vision is not None:
+            from transformers.models.gemma4.configuration_gemma4 import (
+                Gemma4TextConfig,
+                Gemma4VisionConfig,
+            )
+            from transformers.models.gemma4.modeling_gemma4 import (
+                Gemma4MultimodalEmbedder,
+                Gemma4VisionModel,
+            )
+
+            vision_config = Gemma4VisionConfig.from_dict(weights.config.vision_config)
+            text_config = Gemma4TextConfig.from_dict(weights.config.text)
+            for capacity in reversed(PATCH_CAPACITIES):
+                name = f"vision{capacity}"
+                vision_metadata = VisionMetadata.allocate(capacity, device)
+                with torch.device("meta"):
+                    module = Gemma4VisionModel(vision_config)
+                    embed = Gemma4MultimodalEmbedder(vision_config, text_config)
+                module.eval().requires_grad_(False)
+                embed.eval().requires_grad_(False)
+                encoder = PreparedVision(
+                    module,
+                    embed,
+                    vision_storage.rows(capacity),
+                    vision_metadata,
+                    weights.vision,
+                    session=session,
+                    name=name,
+                    workspace=arena,
+                )
+                forward = PreparedVisionGeneration(
+                    encoder, vision_inputs, vision_state, completion, frame, sequence
+                )
+                add(
+                    name,
+                    forward,
+                    "vision",
+                    1,
+                    capacity,
+                    (*vision_inputs.buffers(), "vision_feature_slot"),
+                    enabled=None,
+                )
+                vision_owners.extend((vision_metadata, encoder, forward))
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
         for enabled in modes:
@@ -382,8 +456,19 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                         name=name,
                         workspace=arena,
                         examples=examples,
+                        vision=vision_state,
                     )
-                    batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool)
+                    batch = PreparedBatch(
+                        inputs,
+                        requests,
+                        m,
+                        mode=mode,
+                        shard=weights.shard,
+                        pool=pool,
+                        validate_prefill=vision_state.validate_prefill
+                        if vision_state is not None and mode == "prefill"
+                        else None,
+                    )
                     forward = PreparedGeneration(
                         decoder,
                         batch,
@@ -397,13 +482,18 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                         workspace=arena,
                         context_factory=PreparedContext if enabled else None,
                     )
+                    fields = (
+                        (*forward_inputs, "vision_token_indices", "vision_feature_slot")
+                        if mode == "prefill" and vision_state is not None
+                        else forward_inputs
+                    )
                     add(
                         name,
                         forward,
                         kind,
                         rows,
                         capacity if mode == "prefill" else 1,
-                        forward_inputs,
+                        fields,
                         enabled=enabled,
                     )
         if speculation is not None:
@@ -534,11 +624,23 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
         state_rows=state_rows,
         snapshots=snapshots,
         page_tokens=PAGE_TOKENS,
-        frontend=prepare_frontend(snapshot, eos_token_ids=eos_ids),
+        frontend=prepare_frontend(
+            snapshot,
+            eos_token_ids=eos_ids,
+            image_profile="gemma4" if vision_state is not None else None,
+            preprocessor=snapshot / "processor_config.json",
+        ),
         sampling_defaults=RECIPE.sampling_defaults.as_dict(),
         assets=assets,
         model_contract=prepare_contract(
-            signatures, buffers, pool, vocabulary=vocabulary, world_size=shard.world_size, mtp=drafting
+            signatures,
+            buffers,
+            pool,
+            vocabulary=vocabulary,
+            world_size=shard.world_size,
+            mtp=drafting,
+            vision=vision_state is not None,
+            image_slots=config.image_concurrency,
         ),
     )
     if drafting:
@@ -589,8 +691,11 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             seen_ids.add(id(res))
             close_resources.append(res)
     return PreparedModel(
-        rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'ple', 'draft'),
-            aliases=(('weights.head', 'weights.embedding'),) if weights.head is weights.embedding else ()),
+        rebuild_weights=declare_weights(
+            weights,
+            components=("embedding", "norm", "head", "ple", "draft", "vision"),
+            aliases=(("weights.head", "weights.embedding"),) if weights.head is weights.embedding else (),
+        ),
         device=device_id,
         graphs=graphs,
         buffers=buffers,
@@ -602,7 +707,15 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
         close_resources=tuple(close_resources),
         export_zero_ranges=(
             *(() if scoring is None else scoring.zero_ranges()),
-            *storage_ranges([arena.tensor]),
+            *storage_ranges([
+                arena.tensor,
+                *(() if vision_storage is None else tuple(
+                    getattr(vision_storage, name) for name in vision_storage.__dataclass_fields__
+                )),
+                *(() if vision_state is None else (
+                    vision_state.arena, vision_state.generation, vision_state.count
+                )),
+            ]),
             *completion.zero_ranges(),
         ),
         resources=(
@@ -624,6 +737,11 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             prefill_collective,
             vocabulary_collective,
             speculation,
+            vision_state,
+            vision_inputs,
+            vision_prefill,
+            vision_storage,
+            vision_owners,
         ),
     )
 

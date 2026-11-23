@@ -210,6 +210,7 @@ class ModelConfig:
     text: dict
     quantization: dict
     draft: DraftConfig | None = None
+    vision_config: dict | None = None
 
     @classmethod
     def load(cls, snapshot):
@@ -309,8 +310,17 @@ class ModelConfig:
         softcap = text.get("final_logit_softcapping")
         if softcap is not None and not 0 < float(softcap):
             raise ValueError("Gemma 4 final_logit_softcapping must be positive when set")
-        provisional = cls(architecture, text_prefix, text, {})
-        return cls(architecture, text_prefix, text, _parse_quantization(raw, provisional))
+        vision = raw.get("vision_config")
+        if vision is not None and not isinstance(vision, dict):
+            raise ValueError("Gemma 4 vision_config must be an object")
+        provisional = cls(architecture, text_prefix, text, {}, vision_config=vision)
+        return cls(
+            architecture,
+            text_prefix,
+            text,
+            _parse_quantization(raw, provisional),
+            vision_config=vision,
+        )
 
     def validate_shard(self, shard) -> None:
         if shard.world_size not in (1, 2, 4):
