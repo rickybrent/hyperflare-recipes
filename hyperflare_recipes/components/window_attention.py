@@ -4,8 +4,11 @@
 """Paged attention over circular continuations and private candidate sequences."""
 
 from dataclasses import dataclass, replace
+import math
 
 import torch
+import triton
+import triton.language as tl
 from b12x._lib.compile_plan import attach_programs, compile_only_launches, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
@@ -53,6 +56,78 @@ def commit_window(history, values, row, start, length):
     if history.dtype == torch.float8_e4m3fn:
         committed = committed.clamp(-448, 448)
     history[rows, offsets] = committed.to(history.dtype)
+
+
+@triton.jit
+def _commit_circular_kv(
+    Keys,
+    Values,
+    HistoryKeys,
+    HistoryValues,
+    Starts,
+    Begins,
+    Counts,
+    StateRows,
+    HKS: tl.constexpr,
+    HVS: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    WINDOW: tl.constexpr,
+    CLAMP_FP8: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request, distance = tl.program_id(0), tl.program_id(1)
+    dim = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    start = tl.load(Starts + request).to(tl.int64)
+    count = tl.load(Counts + request).to(tl.int64)
+    begin = tl.load(Begins + request).to(tl.int64)
+    state = tl.load(StateRows + request).to(tl.int64)
+    end = start + count
+    absolute = end - 1 - distance
+    ring_slot = absolute % WINDOW
+    valid = (state > 0) & (count > 0) & (absolute >= start) & (dim < WIDTH)
+    src_row = begin + absolute - start
+    k_val = tl.load(Keys + src_row * KS + dim, valid, other=0.0)
+    v_val = tl.load(Values + src_row * VS + dim, valid, other=0.0)
+    if CLAMP_FP8:
+        k_val = tl.clamp(k_val.to(tl.float32), -448.0, 448.0)
+        v_val = tl.clamp(v_val.to(tl.float32), -448.0, 448.0)
+    tl.store(HistoryKeys + state * HKS + ring_slot * WIDTH + dim, k_val, valid)
+    tl.store(HistoryValues + state * HVS + ring_slot * WIDTH + dim, v_val, valid)
+
+
+def commit_circular_kv(key, value, history_key, history_value, metadata, counts=None):
+    """Batched circular KV commit for accepted prefixes across all active requests."""
+    if key.ndim != 3 or value.shape != key.shape or history_key.ndim != 4 or history_value.shape != history_key.shape:
+        raise ValueError("circular KV commit requires 3D candidate and 4D circular history tensors with matching shapes")
+    if history_key.shape[2:] != key.shape[1:] or history_key.dtype != history_value.dtype:
+        raise ValueError("circular KV commit requires matching head geometry and history dtypes")
+    counts = metadata.lengths if counts is None else counts
+    flat_k, flat_v = key.reshape(key.shape[0], -1), value.reshape(value.shape[0], -1)
+    width = flat_k.shape[1]
+    window = history_key.shape[1]
+    clamp_fp8 = history_key.dtype == torch.float8_e4m3fn
+    torch.library.wrap_triton(_commit_circular_kv)[
+        (counts.numel(), min(window, key.shape[0]), triton.cdiv(width, 256))
+    ](
+        flat_k,
+        flat_v,
+        history_key,
+        history_value,
+        metadata.starts,
+        metadata.query_start_loc,
+        counts,
+        metadata.state_rows,
+        history_key.stride(0),
+        history_value.stride(0),
+        flat_k.stride(0),
+        flat_v.stride(0),
+        width,
+        window,
+        clamp_fp8,
+        256,
+    )
 
 
 @dataclass(frozen=True)
@@ -111,7 +186,7 @@ class State:
     programs: dict
 
 
-def _run(query, key, value, history_key, history_value, requests, positions, starts, begins, states, output, output_gate, descale, scratch, state):
+def _run(query, key, value, history_key, history_value, requests, positions, starts, begins, states, output, output_gate, descale, scratch, softmax_scale, state):
     from b12x.attention.paged._selected_forward import (
         BFloat16,
         Float32,
@@ -141,7 +216,7 @@ def _run(query, key, value, history_key, history_value, requests, positions, sta
         _pointer(output, BFloat16),
         _pointer(output_gate, BFloat16) if output_gate is not None else _fake_pointer(BFloat16),
         continuation, history_key.shape[0], starts.numel(), 0,
-        dim ** -.5, rows, splits, current_cuda_stream()))
+        float(softmax_scale), rows, splits, current_cuda_stream()))
     if splits > 1:
         run_compiled(state.programs["merge"], (partial, lse, _pointer(output, BFloat16),
             _fake_pointer(Float32),
@@ -153,14 +228,15 @@ def _run(query, key, value, history_key, history_value, requests, positions, sta
 def _execute(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, history_key: torch.Tensor,
              history_value: torch.Tensor, requests: torch.Tensor, positions: torch.Tensor,
              starts: torch.Tensor, begins: torch.Tensor, states: torch.Tensor, output: torch.Tensor,
-             output_gate: torch.Tensor | None, descale: torch.Tensor, scratch: torch.Tensor, handle: int) -> None:
+             output_gate: torch.Tensor | None, descale: torch.Tensor, scratch: torch.Tensor,
+             softmax_scale: float, handle: int) -> None:
     plan = plan_from_handle(handle)
     _run(query, key, value, history_key, history_value, requests, positions, starts, begins, states,
-         output, output_gate, descale, scratch, require_prepared(plan, plan.component_id, query.device))
+         output, output_gate, descale, scratch, softmax_scale, require_prepared(plan, plan.component_id, query.device))
 
 
 @_execute.register_fake
-def _fake(query, key, value, history_key, history_value, requests, positions, starts, begins, states, output, output_gate, descale, scratch, handle):
+def _fake(query, key, value, history_key, history_value, requests, positions, starts, begins, states, output, output_gate, descale, scratch, softmax_scale, handle):
     pass
 
 
@@ -168,7 +244,8 @@ class PreparedWindowAttention:
     """Read circular KV and packed candidates through b12x's paged-forward engine."""
 
     def __init__(self, query, key, value, history_key, history_value, metadata, output, *,
-                 first_position=0, proposal=None, output_gate=None, session, workspace, name):
+                 first_position=0, proposal=None, output_gate=None, softmax_scale=None,
+                 session, workspace, name):
         self.key, self.value, self.proposal = key, value, proposal
         if (query.ndim != 3 or key.ndim != 3 or history_key.ndim != 4
                 or query.dtype != torch.bfloat16 or query.shape[-1] not in (192, 256)
@@ -182,6 +259,12 @@ class PreparedWindowAttention:
                 or any(not t.is_contiguous() for t in (query, key, value, output))
                 or any(t.dtype != history_key.dtype or t.stride(-1) != 1 for t in (history_key, history_value))):
             raise ValueError("circular GQA requires BF16 queries, BF16 candidates, matching BF16/FP8 history, and 192/256-dimensional heads")
+        if softmax_scale is not None:
+            if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, (int, float)) or not math.isfinite(softmax_scale) or softmax_scale <= 0:
+                raise ValueError("circular GQA softmax_scale must be a positive finite float")
+            self.softmax_scale = float(softmax_scale)
+        else:
+            self.softmax_scale = float(query.shape[-1] ** -0.5)
         m = metadata
         if proposal is not None:
             key, value = (t.flatten(0, 1) for t in proposal[:2])
@@ -207,7 +290,7 @@ class PreparedWindowAttention:
             compile_jobs=lambda t, d: (CompileJob.create(
                 "hyperflare_recipes.components.window_attention:compile_attention", payload, t, d.ordinal),))
 
-        declaration, declaration_gate = self.arguments, self.output_gate
+        declaration, declaration_gate, scale = self.arguments, self.output_gate, self.softmax_scale
 
         def call(state, benchmark=False):
             args, produce, gate = declaration, None, declaration_gate
@@ -234,7 +317,7 @@ class PreparedWindowAttention:
                             device=output_gate.device, dtype=output_gate.dtype).normal_())
             scratch = planned_scratch((scratch_buffer_spec(CONTRACT.component_id,
                 nbytes=q.scratch_bytes(state.tactic), device=query.device),), workspace)
-            return PreparedCall(run=lambda: _run(*args, gate, self.descale, scratch, state), output=args[-1], produce=produce,
+            return PreparedCall(run=lambda: _run(*args, gate, self.descale, scratch, scale, state), output=args[-1], produce=produce,
                                 owners=prime_owners(workspace, scratch, (args, gate)))
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: replace(call(state, True), owners=()),
             benchmark_call=lambda state: call(state, True)),))
@@ -265,8 +348,9 @@ class PreparedWindowAttention:
         m = metadata
         output = torch.zeros(self.output_shape, dtype=query.dtype, device=query.device)
         scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+        scale = getattr(self, "softmax_scale", float(query.shape[-1] ** -0.5))
         _execute(query, key, value, *self.history, m.requests, m.positions, m.starts,
-                 m.query_start_loc, m.state_rows, output, output_gate, self.descale, scratch, self.plan.handle)
+                 m.query_start_loc, m.state_rows, output, output_gate, self.descale, scratch, scale, self.plan.handle)
         return output
 
     def _bound_call(self):
@@ -274,7 +358,8 @@ class PreparedWindowAttention:
             key, value, step = self.proposal
             key[:, step].copy_(self.key)
             value[:, step].copy_(self.value)
-        _execute(*self.arguments, self.output_gate, self.descale, self.scratch, self.plan.handle)
+        scale = getattr(self, "softmax_scale", float(self.arguments[0].shape[-1] ** -0.5))
+        _execute(*self.arguments, self.output_gate, self.descale, self.scratch, scale, self.plan.handle)
         return self.arguments[-1]
 
     def scratch_tensors(self):

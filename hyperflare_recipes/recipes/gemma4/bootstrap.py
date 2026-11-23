@@ -267,6 +267,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                     "draft": weights.config.draft.text if drafting else None,
                     "headers": [s.header_sha256 for s in manifest.shards],
                     "world_size": shard.world_size,
+                    "sliding_storage": "circular",
                     "contract": "gemma4.graph-inputs.v1",
                 },
                 sort_keys=True,

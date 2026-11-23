@@ -102,7 +102,15 @@ def test_window_attention_consumes_runtime_metadata_and_proposals(monkeypatch):
     torch.testing.assert_close(proposal[1][:, 1], q * 3)
     assert seen[0][5] is m.requests and seen[0][9] is m.state_rows
     assert seen[0][1].shape == (6, 1, 4)
+    assert seen[0][14] == pytest.approx(4 ** -0.5)
     assert op.arguments is op.proposal is None
+
+    # Explicit softmax_scale forwards at runtime without changing Query/CONTRACT.
+    op.softmax_scale = 1.0
+    out_unit = op(q, q * 2, q * 3, m, proposal=proposal)
+    torch.testing.assert_close(out_unit, q)
+    assert seen[1][14] == 1.0
+    assert module.CONTRACT.query_fields == frozenset({"operands", "first_position", "output_gate"})
 
 
 def test_projection_pending_keeps_every_operand_through_join(monkeypatch):
