@@ -160,9 +160,19 @@ class ModelWeights:
     ple: PLEWeights | None = None
     shard: TensorParallelShard = TensorParallelShard(0, 1)
     draft: DraftWeights | None = None
+    vision: object | None = None
 
     @classmethod
-    def load(cls, manifest, device, *, shard: TensorParallelShard = TensorParallelShard(0, 1), progress=None, draft_checkpoint=None):
+    def load(
+        cls,
+        manifest,
+        device,
+        *,
+        shard: TensorParallelShard = TensorParallelShard(0, 1),
+        progress=None,
+        draft_checkpoint=None,
+        language_model_only=False,
+    ):
         config = ModelConfig.load(manifest.snapshot)
         if draft_checkpoint is not None:
             config = replace(config, draft=DraftConfig.load(draft_checkpoint, config))
@@ -192,6 +202,16 @@ class ModelWeights:
             if config.draft is None
             else DraftWeights.load(draft_checkpoint, config.draft, device, shard=shard, progress=progress)
         )
+        vision = None
+        if (
+            not language_model_only
+            and config.vision_config is not None
+            and "model.vision_tower.patch_embedder.input_proj.weight" in manifest.tensors
+        ):
+            from .vision import VisionWeights
+
+            with VisionWeightLoader(manifest, device, progress=progress) as loader:
+                vision = VisionWeights.from_checkpoint(loader, config.vision_config, config.text)
         return cls(
             config=config,
             embedding=embedding,
@@ -202,6 +222,18 @@ class ModelWeights:
             ple=ple,
             shard=shard,
             draft=draft,
+            vision=vision,
+        )
+
+
+class VisionWeightLoader(DirectWeightLoader):
+    def __init__(self, manifest, device, progress=None):
+        super().__init__(
+            manifest,
+            device,
+            prefixes=("model.vision_tower.", "model.embed_vision."),
+            progress=progress,
+            progress_label="Load vision weights",
         )
 
 

@@ -18,6 +18,7 @@ from ignition.parameters import (
     PromptLogprobsParameters,
     RecipeParameters,
     SpeculationParameters,
+    VisionParameters,
 )
 from ignition.preparation.bootstrap import common_preparation_kwargs
 
@@ -127,6 +128,8 @@ RECIPE = Recipe(
     served_model_name="Gemma-4",
     prepare=prepare,
     usage=usage,
+    max_images=4,
+    image_bytes=32 << 20,
     # Gemma 4 model card sampling recommendations: https://huggingface.co/google/gemma-4-26B-A4B-it.
     sampling_defaults=SamplingDefaults(
         temperature=1.0,
@@ -246,6 +249,7 @@ RECIPE = Recipe(
         max_concurrency_limit=64,
         prefill_chunk=4096,
         speculation=SpeculationParameters(draft_tokens=5, max_draft_tokens=7),
+        vision=VisionParameters(separable_encoder=True),
         prompt_logprobs=PromptLogprobsParameters(),
     ),
     ranks=_26B_RANKS,
