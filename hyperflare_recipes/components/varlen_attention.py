@@ -16,12 +16,14 @@ from ignition.preparation.tuning import declare, register_finalizer
 
 class PreparedVarlenAttention:
     def __init__(self, q, k, v, cu, out, *, session, workspace, name, window=None, sink=None, max_seqlen=None,
-                 math_mode="flash"):
+                 math_mode="flash", softmax_scale=None):
         self.q, self.k, self.v, self.cu, self.out = q, k, v, cu, out
         self.workspace = workspace
         self.sink = sink
         self.max_seqlen = q.shape[0] if max_seqlen is None else max_seqlen
-        if type(self.max_seqlen) is not int or not 0 < self.max_seqlen <= q.shape[0]:
+        self.softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        if (type(self.max_seqlen) is not int or not 0 < self.max_seqlen <= q.shape[0]
+                or type(self.softmax_scale) is not float or not 0 < self.softmax_scale < float("inf")):
             raise ValueError("maximum attention sequence must fit the prepared query capacity")
         arithmetic = {} if math_mode == "flash" else {"math_mode": math_mode}
         self.plan = varlen.plan(q, k, v, cu, max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen,
@@ -34,7 +36,7 @@ class PreparedVarlenAttention:
             "cu_seqlens_q": cu,
             "max_seqlen_q": self.max_seqlen,
             "max_seqlen_k": self.max_seqlen,
-            "softmax_scale": q.shape[-1] ** -0.5,
+            "softmax_scale": self.softmax_scale,
             "causal": False,
             "attention_sink_bias": sink,
         }
@@ -79,7 +81,11 @@ class PreparedVarlenAttention:
             scratch, = (torch.empty(shape, dtype=dtype, device=q.device) for shape, dtype in self.scratch_layout)
         else:
             q, k, v, cu, output, scratch = self.q, self.k, self.v, self.cu, self.out, self.scratch
+        scale = getattr(self, "softmax_scale", None)
+        if scale is None:
+            scale = q.shape[-1] ** -0.5
         varlen.run_out(q, k, v, cu, out=output,
             scratch=scratch, plan=self.plan, attention_sink_bias=self.sink,
-            max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen)
+            max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen,
+            softmax_scale=scale)
         return output
