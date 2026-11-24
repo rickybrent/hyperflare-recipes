@@ -30,12 +30,13 @@ def test_varlen_releases_templates_and_preserves_strided_output(monkeypatch):
     seen = []
 
     def execute(q, k, v, cu, *, out, scratch, **kwargs):
-        seen.append((cu.clone(), scratch))
+        seen.append((cu.clone(), scratch, kwargs.get("softmax_scale")))
         out[:2].copy_((q + k + v)[:2])
 
     monkeypatch.setattr(module.varlen, "run_out", execute)
     q = torch.ones(4, 2, 3)
     first = op(q, q * 2, q * 3, torch.tensor([0, 2], dtype=torch.int32))
+    op.softmax_scale = 1.0
     second = op(q * 4, q * 2, q, torch.tensor([0, 1], dtype=torch.int32))
     assert first.stride() == second.stride() == (8, 3, 1)
     assert torch.equal(first[:2], torch.full((2, 2, 3), 6.))
@@ -43,6 +44,8 @@ def test_varlen_releases_templates_and_preserves_strided_output(monkeypatch):
     assert not first[2:].count_nonzero() and not second[2:].count_nonzero()
     assert first.data_ptr() != second.data_ptr()
     assert seen[0][1].data_ptr() != seen[1][1].data_ptr()
+    assert seen[0][2] == pytest.approx(3 ** -0.5)
+    assert seen[1][2] == 1.0
     op._finalize_functional()
     assert op.q is op.out is op.scratch is None
 
