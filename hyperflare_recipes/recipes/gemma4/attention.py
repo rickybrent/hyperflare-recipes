@@ -14,6 +14,7 @@ from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
 from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv
 from hyperflare_recipes.components.window_staging import PreparedWindowStaging
+from hyperflare_recipes.components.wide_paged_decode import PreparedWidePagedDecode
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 
@@ -101,20 +102,13 @@ class PreparedAttention:
 
         batch = metadata.lengths.numel()
         width = 1 if mode == "prefill" else tokens // batch
-        gqa_group = self.heads // self.kv_heads
-        q_cap = (
-            tokens
-            if self.is_sliding or mode == "prefill"
-            else batch * max(width, (32 // gqa_group) + 1, 2)
-        )
 
         def zeros(role, shape, dtype=torch.bfloat16):
             return declaration_tensor(examples, "attention." + role, shape, dtype, source.device)
 
         self.q_norm = weights["q_norm"]
         self.q_raw = zeros("q_raw", (tokens, self.heads * self.dim))
-        self.q_full = zeros("q_full", (q_cap, self.heads, self.dim))
-        self.q = self.q_full[:tokens]
+        self.q = zeros("q", (tokens, self.heads, self.dim))
         self.attended = zeros("attended", (tokens, self.heads * self.dim))
         self.partial_output = zeros("partial_output", (tokens, config.hidden))
         self.output = zeros("output", (tokens, config.hidden))
@@ -258,50 +252,69 @@ class PreparedAttention:
                     v_scale=unit_scale,
                     caller_owned_placeholders=True,
                 )
-            self.attended_lo_full = zeros("attended_lo_full", (q_cap, self.heads, half_dim))
-            self.attended_hi_full = zeros("attended_hi_full", (q_cap, self.heads, half_dim))
-            self.attended_lo = self.attended_lo_full[:tokens]
-            self.attended_hi = self.attended_hi_full[:tokens]
-            self.attention_lo = PreparedPagedAttention(
-                self.q_full,
-                key_cache,
-                value_lo_cache,
-                metadata.page_table,
-                cache_metadata.lengths,
-                metadata.query_start_loc,
-                self.attended_lo_full,
-                mode="prefill",
-                window=-1,
-                width=1,
-                session=session,
-                name=name + ".attention_lo",
-                workspace=workspace,
-                caller_owned_placeholders=True,
-                tuning_page_count=int(pool.memory_capacity[1].item()),
-                k_descale=k_descale,
-                v_descale=unit_scale,
-            )
-            self.attention_hi = PreparedPagedAttention(
-                self.q_full,
-                key_cache,
-                value_hi_cache,
-                metadata.page_table,
-                cache_metadata.lengths,
-                metadata.query_start_loc,
-                self.attended_hi_full,
-                mode="prefill",
-                window=-1,
-                width=1,
-                session=session,
-                name=name + ".attention_hi",
-                workspace=workspace,
-                caller_owned_placeholders=True,
-                tuning_page_count=int(pool.memory_capacity[1].item()),
-                k_descale=k_descale,
-                v_descale=unit_scale,
-            )
+            self.attention = None
+            self.attention_lo = None
+            self.attention_hi = None
+            if mode == "prefill":
+                self.attended_lo = zeros("attended_lo", (tokens, self.heads, half_dim))
+                self.attended_hi = zeros("attended_hi", (tokens, self.heads, half_dim))
+                self.attention_lo = PreparedPagedAttention(
+                    self.q,
+                    key_cache,
+                    value_lo_cache,
+                    metadata.page_table,
+                    cache_metadata.lengths,
+                    metadata.query_start_loc,
+                    self.attended_lo,
+                    mode="prefill",
+                    window=-1,
+                    width=1,
+                    session=session,
+                    name=name + ".attention_lo",
+                    workspace=workspace,
+                    caller_owned_placeholders=True,
+                    tuning_page_count=int(pool.memory_capacity[1].item()),
+                    k_descale=k_descale,
+                    v_descale=unit_scale,
+                )
+                self.attention_hi = PreparedPagedAttention(
+                    self.q,
+                    key_cache,
+                    value_hi_cache,
+                    metadata.page_table,
+                    cache_metadata.lengths,
+                    metadata.query_start_loc,
+                    self.attended_hi,
+                    mode="prefill",
+                    window=-1,
+                    width=1,
+                    session=session,
+                    name=name + ".attention_hi",
+                    workspace=workspace,
+                    caller_owned_placeholders=True,
+                    tuning_page_count=int(pool.memory_capacity[1].item()),
+                    k_descale=k_descale,
+                    v_descale=unit_scale,
+                )
+            else:
+                self.attention = PreparedWidePagedDecode(
+                    self.q,
+                    key_cache,
+                    value_lo_cache,
+                    value_hi_cache,
+                    metadata.page_table,
+                    cache_metadata.lengths,
+                    metadata.query_start_loc,
+                    self.attended.view(tokens, self.heads, self.dim),
+                    width=width,
+                    k_descale=k_descale,
+                    v_descale=unit_scale,
+                    session=session,
+                    workspace=workspace,
+                    name=name + ".attention",
+                    tuning_page_count=int(pool.memory_capacity[1].item()),
+                )
 
-        self.q_cap = q_cap
         for projection in (self.q_proj, self.o_proj, self.k_proj, self.v_proj):
             if projection is not None:
                 projection.functional(session=session)
@@ -313,7 +326,7 @@ class PreparedAttention:
             if operation is not None:
                 setattr(self, field, operation.functional())
         if getattr(self, "attention", None) is not None:
-            if isinstance(self.attention, PreparedWindowAttention):
+            if isinstance(self.attention, (PreparedWindowAttention, PreparedWidePagedDecode)):
                 self.attention = self.attention.functional(session=session)
             else:
                 self.attention = self.attention.functional(
@@ -400,11 +413,12 @@ class PreparedAttention:
             self.writer_k(key, hi, cache_metadata.slots)
         arguments = dict(page_table=metadata.page_table, cache_seqlens=cache_metadata.lengths,
                          cu_seqlens_q=metadata.query_start_loc)
-        full_query = torch.zeros((self.q_cap, self.heads, self.dim), dtype=query.dtype, device=query.device)
-        full_query[:tokens].copy_(query)
-        lo = self.attention_lo(full_query, **arguments)[:tokens]
-        hi = self.attention_hi(full_query, **arguments)[:tokens]
-        attended = torch.cat((lo, hi), dim=-1)
+        if self.attention is not None:
+            attended = self.attention(query, **arguments)
+        else:
+            lo = self.attention_lo(query, **arguments)
+            hi = self.attention_hi(query, **arguments)
+            attended = torch.cat((lo, hi), dim=-1)
         return self.reduce(self.o_proj(attended.reshape(tokens, -1)))
 
 
