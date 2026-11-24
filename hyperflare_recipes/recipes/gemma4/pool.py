@@ -14,18 +14,15 @@ from .config import PAGE_TOKENS
 
 def page_specs(config, shard: TensorParallelShard = TensorParallelShard(0, 1)):
     for index in range(config.first_kv_shared_layer):
+        if config.is_sliding(index):
+            continue
         kv_heads = config.local_kv_heads(index, shard)
         dim = config.layer_head_dim(index)
-        if config.is_sliding(index):
-            size = PAGE_TOKENS * kv_heads * dim
-            for field in ("key", "value"):
-                yield f"layer{index}.{field}", (size,)
-        else:
-            key_size = PAGE_TOKENS * kv_heads * dim
-            half_value_size = PAGE_TOKENS * kv_heads * (dim // 2)
-            yield f"layer{index}.key", (key_size,)
-            yield f"layer{index}.value_lo", (half_value_size,)
-            yield f"layer{index}.value_hi", (half_value_size,)
+        key_size = PAGE_TOKENS * kv_heads * dim
+        half_value_size = PAGE_TOKENS * kv_heads * (dim // 2)
+        yield f"layer{index}.key", (key_size,)
+        yield f"layer{index}.value_lo", (half_value_size,)
+        yield f"layer{index}.value_hi", (half_value_size,)
 
 
 def page_bytes(config, shard: TensorParallelShard = TensorParallelShard(0, 1)):
@@ -33,7 +30,16 @@ def page_bytes(config, shard: TensorParallelShard = TensorParallelShard(0, 1)):
 
 
 def continuation_layout(config, shard: TensorParallelShard = TensorParallelShard(0, 1)):
-    regions = [(name, shape, torch.uint8) for name, shape in page_specs(config, shard)]
+    regions = []
+    for index in range(config.first_kv_shared_layer):
+        if config.is_sliding(index):
+            kv_heads = config.local_kv_heads(index, shard)
+            dim = config.layer_head_dim(index)
+            for field in ("key", "value"):
+                regions.append(
+                    (f"layer{index}.{field}", (config.sliding_window, kv_heads, dim), torch.float8_e4m3fn)
+                )
+    regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config, shard))
     regions.extend((
         ("last_hidden", (config.hidden,), torch.bfloat16),
         ("consumed_tokens", (1,), torch.int64),
@@ -64,14 +70,13 @@ class ContinuationPool(PagedStateStorage):
 
     def attention(self, layer, config, shard: TensorParallelShard = TensorParallelShard(0, 1)):
         donor = config.kv_source_layer(layer)
+        if config.is_sliding(layer):
+            return (
+                self.reserved_region(f"layer{donor}.key"),
+                self.reserved_region(f"layer{donor}.value"),
+            )
         kv_heads = config.local_kv_heads(layer, shard)
         dim = config.layer_head_dim(layer)
-        if config.is_sliding(layer):
-            shape = (-1, PAGE_TOKENS, kv_heads, dim)
-            return tuple(
-                self.pages[f"layer{donor}.{field}"].view(torch.float8_e4m3fn).view(shape)
-                for field in ("key", "value")
-            )
         key_shape = (-1, PAGE_TOKENS, kv_heads, dim)
         value_shape = (-1, PAGE_TOKENS, kv_heads, dim // 2)
         return (

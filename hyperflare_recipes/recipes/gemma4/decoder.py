@@ -12,6 +12,7 @@ from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.paged_resume import PreparedResume
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
+from hyperflare_recipes.components.window_attention import commit_circular_kv
 
 from .attention import PreparedAttention, attention_descales, cache_bindings, declaration_tensor, prepare_projection, rms_norm
 from ignition.preparation.persistent import persistent_copy
@@ -85,6 +86,7 @@ class PreparedLayer:
         cache_metadata,
         unit_scale: torch.Tensor,
         k_descale: torch.Tensor,
+        frozen_kv: bool = False,
     ):
         self.index = index
         self.config = config
@@ -122,6 +124,7 @@ class PreparedLayer:
             cache_metadata=cache_metadata,
             unit_scale=unit_scale,
             k_descale=k_descale,
+            frozen_kv=frozen_kv,
         )
 
         self.gate_out = zeros("gate_out", (tokens, inter))
@@ -204,10 +207,19 @@ class PreparedLayer:
             if hasattr(self, field):
                 setattr(self, field, None)
 
-    def __call__(self, hidden_states, cos, sin, ple_input=None, *, metadata, cache_metadata):
+    def __call__(self, hidden_states, cos, sin, ple_input=None, *, metadata, cache_metadata,
+                 sliding_donor=None, deferred_sliding=None):
         residual = hidden_states
         normalized = rms_norm(residual, self.input_layernorm, self.eps)
-        attn_out = self.self_attn(normalized, cos, sin, metadata=metadata, cache_metadata=cache_metadata)
+        attn_out = self.self_attn(
+            normalized,
+            cos,
+            sin,
+            metadata=metadata,
+            cache_metadata=cache_metadata,
+            sliding_donor=sliding_donor,
+            deferred_sliding=deferred_sliding,
+        )
         hidden_states = residual + rms_norm(attn_out, self.post_attention_layernorm, self.eps)
         residual = hidden_states
         normalized = rms_norm(residual, self.pre_feedforward_layernorm, self.eps)
@@ -262,6 +274,7 @@ class PreparedDecoder:
         self.scratch = scratch
         self.metadata = metadata
         self.pool = pool
+        self.mode = mode
         self.auxiliary = None
         config = weights.config
         self.config = config
@@ -401,10 +414,21 @@ class PreparedDecoder:
             ple_proj = rms_norm(ple_proj, self.weights.ple.norm, self.eps)
             ple_inputs = (ple_proj + ple_tok) * self.ple_combine_scale
 
+        sliding_donor = []
+        deferred_sliding = [] if self.mode == "verify" else None
         for index, layer in enumerate(self.layers):
             cos, sin = (sliding_cos, sliding_sin) if layer.is_sliding else (full_cos, full_sin)
             ple_layer = None if ple_inputs is None else ple_inputs[:, index, :]
-            hidden = layer(hidden, cos, sin, ple_layer, metadata=m, cache_metadata=cache_metadata)
+            hidden = layer(
+                hidden,
+                cos,
+                sin,
+                ple_layer,
+                metadata=m,
+                cache_metadata=cache_metadata,
+                sliding_donor=sliding_donor,
+                deferred_sliding=deferred_sliding,
+            )
 
         normalized = rms_norm(hidden, self.weights.norm, self.eps)
         if self.scoring is not None:
@@ -415,4 +439,9 @@ class PreparedDecoder:
         sampled = normalized[m.sample_indices]
         logits = self.head(sampled)
         softcap_logits(logits, self.softcap)
-        return sampled, logits, None, None
+        return sampled, logits, deferred_sliding, None
+
+    @staticmethod
+    def commit_sliding(deferred_sliding, metadata, counts):
+        for history_key, history_value, key, value in deferred_sliding:
+            commit_circular_kv(key, value, history_key, history_value, metadata, counts)

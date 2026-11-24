@@ -137,3 +137,55 @@ def test_ring_commit_updates_only_accepted_slots(extent, capacity, count, kv_dty
     torch.testing.assert_close(state_values.float(), expected_values.float(), atol=0, rtol=0)
     torch.testing.assert_close(state_scores.float(), expected_scores.float(), atol=0, rtol=0)
     graph.reset()
+
+
+@pytest.mark.parametrize("functional", [False, True])
+def test_window_attention_unit_softmax_scale_256(functional):
+    torch.manual_seed(911)
+    device = torch.device("cuda:0")
+    window, heads, groups, dim, batch, width = 1024, 32, 16, 256, 2, 4
+    tokens = batch * width
+    q = (torch.randn(tokens, heads, dim, device=device) * 0.1).bfloat16()
+    k = (torch.randn(tokens, groups, dim, device=device) * 0.1).bfloat16()
+    v = (torch.randn(tokens, groups, dim, device=device) * 0.2).bfloat16()
+    hk = (torch.randn(batch + 1, window, groups, dim, device=device) * 0.1).bfloat16().to(torch.float8_e4m3fn)
+    hv = (torch.randn(batch + 1, window, groups, dim, device=device) * 0.2).bfloat16().to(torch.float8_e4m3fn)
+    m = Metadata.allocate(tokens, batch, 1, device)
+    starts = torch.tensor([1500, 1022], dtype=torch.int64, device=device)
+    counts = torch.full((batch,), width, dtype=torch.int32, device=device)
+    m.set(starts, counts, torch.arange(1, batch + 1, device=device), m.page_table,
+          torch.zeros(batch, width, dtype=torch.int64, device=device), torch.tensor([batch], device=device))
+    out = torch.empty_like(q)
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="window-gqa-unit", workload_schema="window-gqa-unit",
+                                    numerical_policy="default") as session:
+        session.register_scratch(arena)
+        op = PreparedWindowAttention(q, k, v, hk, hv, m, out, softmax_scale=1.0,
+                                     session=session, workspace=arena, name="window_unit")
+        if functional:
+            op.functional(session=session)
+        session.tune()
+        if functional:
+            arena.release_preparation()
+            attn = op
+            fn = lambda: out.copy_(attn(q, k, v, m))
+        else:
+            fn = op
+        compiled = compile_forward(fn)
+        compiled()
+        torch.cuda.synchronize()
+        gqa = heads // groups
+        for row in range(batch):
+            begin = int(starts[row])
+            for col in range(width):
+                token = row * width + col
+                pos = int(m.positions[token])
+                positions = torch.arange(max(0, pos - window + 1), pos + 1, device=device)
+                old = positions < begin
+                ks = torch.cat((hk[row + 1, positions[old] % window].float(), k[row * width + (positions[~old] - begin)].float()), dim=0)
+                vs = torch.cat((hv[row + 1, positions[old] % window].float(), v[row * width + (positions[~old] - begin)].float()), dim=0)
+                for h in range(heads):
+                    g = h // gqa
+                    logits = q[token, h].float() @ ks[:, g].T  # scale = 1.0
+                    expected = logits.softmax(-1) @ vs[:, g]
+                    torch.testing.assert_close(out[token, h].float(), expected, atol=0.015, rtol=0.03)
