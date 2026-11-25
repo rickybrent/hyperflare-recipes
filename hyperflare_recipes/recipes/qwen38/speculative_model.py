@@ -363,9 +363,11 @@ class PreparedSpeculativeRound:
         target_scratch = bind_scratch(target.layout, device=slots.device)
         target_probs = target.run(target_scratch, logits.view(b, w, -1), candidates=drafts, slots=slots,
             generations=inputs.row_generations[:b], live_rows=inputs.live_rows, token_limits=token_limits)
-        verify_scratch = bind_scratch(verify.layout, device=slots.device)
+        verify_scratch = bind_scratch(
+            PreparedStochasticVerification.scratch_layout(b, w, o.requests.vocab_size, consume_inputs=True),
+            device=slots.device)
         acceptance = verify.run(verify_scratch, draft_probabilities, target_probs, target_scratch["valid"],
-                                drafts=drafts, draft_valid=draft_valid, slots=slots,
+                                consume_inputs=True, drafts=drafts, draft_valid=draft_valid, slots=slots,
                                 generations=inputs.row_generations[:b], live_rows=inputs.live_rows, token_limits=token_limits)
         committed = commit(logits.view(b, w, -1), acceptance=acceptance,
                            inputs=runtime.ple.token_ids.view(b, w), copy_offered_mask=copy_mask,

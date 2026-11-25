@@ -162,6 +162,54 @@ def _mask_invalid_scores(Scores, Valid, V: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Scores + pid0.to(tl.int64) * V + token, val, mask=inside)
 
 
+@triton.jit
+def _validate_probabilities_blocks(
+    Probs, Limits, BlockValid, BlockMass,
+    COLUMNS: tl.constexpr, V: tl.constexpr,
+    LIMITED: tl.constexpr, LIMIT_OFFSET: tl.constexpr,
+    BLOCK: tl.constexpr, BLOCKS: tl.constexpr,
+):
+    pid0 = tl.program_id(0)
+    block = tl.program_id(1)
+    row = pid0 // COLUMNS
+    col = pid0 % COLUMNS
+    if LIMITED:
+        limit = tl.load(Limits + row)
+        if col >= limit - LIMIT_OFFSET:
+            tl.store(BlockValid + pid0 * BLOCKS + block, 1)
+            tl.store(BlockMass + pid0 * BLOCKS + block,
+                     tl.full((), 1.0, tl.float32) if block == 0 else tl.full((), 0.0, tl.float32))
+            return
+    token = block * BLOCK + tl.arange(0, BLOCK)
+    inside = token < V
+    val = tl.load(Probs + pid0.to(tl.int64) * V + token, mask=inside, other=0.0)
+    finite_nonneg = (val == val) & (val < float("inf")) & (val >= 0.0)
+    ok = tl.min(tl.where(inside, finite_nonneg.to(tl.int32), 1), 0)
+    mass = tl.sum(tl.where(inside, val, 0.0), 0)
+    tl.store(BlockValid + pid0 * BLOCKS + block, ok)
+    tl.store(BlockMass + pid0 * BLOCKS + block, mass)
+
+
+@triton.jit
+def _validate_probabilities_finish(
+    BlockValid, BlockMass, Valid,
+    COLUMNS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK_COUNT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    part = tl.arange(0, BLOCK_COUNT)
+    inside = part < BLOCKS
+    row_ok = tl.load(Valid + row) != 0
+    for col in tl.static_range(COLUMNS):
+        base = (row * COLUMNS + col) * BLOCKS + part
+        bvalid = tl.load(BlockValid + base, mask=inside, other=1)
+        bmass = tl.load(BlockMass + base, mask=inside, other=0.0)
+        entries_ok = tl.min(bvalid, 0) != 0
+        mass = tl.sum(bmass, 0)
+        mass_ok = (mass == mass) & (tl.abs(mass) < float("inf")) & (tl.abs(mass - 1.0) <= 1e-4)
+        row_ok = row_ok & entries_ok & mass_ok
+    tl.store(Valid + row, row_ok)
+
+
 def _sliced(values: torch.Tensor) -> torch.Tensor:
     slices = VOCABULARY_SLICES if values.shape[-1] % VOCABULARY_SLICES == 0 else 1
     return values.unflatten(-1, (slices, values.shape[-1] // slices))
@@ -461,12 +509,14 @@ class PreparedStochasticVerification:
     """
 
     @staticmethod
-    def scratch_layout(batch, width, vocab):
-        return dict(safe_draft_probs=((batch, width - 1, vocab), torch.float32),
-            safe_target_probs=((batch, width, vocab), torch.float32),
-            safe_ids=((batch, width - 1), torch.int32), seed_bits=((batch,), torch.int64),
+    def scratch_layout(batch, width, vocab, *, consume_inputs=False):
+        layout = dict(safe_ids=((batch, width - 1), torch.int32), seed_bits=((batch,), torch.int64),
             offset=((batch,), torch.int64), independent_accepted=((batch,), torch.int32),
             emitted_drafts=((batch,), torch.int32))
+        if not consume_inputs:
+            layout = dict(safe_draft_probs=((batch, width - 1, vocab), torch.float32),
+                safe_target_probs=((batch, width, vocab), torch.float32), **layout)
+        return layout
 
     def __init__(self, draft_probs, draft_token_ids, target_probs, requests, slots, generations,
                  live_rows, *, rng, draft_valid=None, target_valid=None, output=None, token_limits=None,
@@ -562,7 +612,7 @@ class PreparedStochasticVerification:
             self.broadcast.functional(session=session)
         return self
 
-    def run(self, scratch, draft_probs, target_probs, target_valid, *, drafts=None, draft_valid=None, disjoint=False, slots=None, generations=None, live_rows=None, token_limits=None):
+    def run(self, scratch, draft_probs, target_probs, target_valid, *, drafts=None, draft_valid=None, disjoint=False, consume_inputs=False, slots=None, generations=None, live_rows=None, token_limits=None):
         if not self._prepared:
             raise RuntimeError("chain verification requires prepare() before capture")
         functional = getattr(self, "_functional", False)
@@ -591,20 +641,64 @@ class PreparedStochasticVerification:
             valid = live & (draft_valid | ~draft_used).all(-1) & (target_valid | ~target_used).all(-1)
             valid &= (((drafts >= 0) & (drafts < self.state.vocab_size)) | ~draft_used).all(-1)
             valid &= (token_limits >= 1) & (token_limits <= target_probs.shape[1])
-            draft_probs = torch.where(draft_used[:, :, None], draft_probs, dummy)
-            target_probs = torch.where(target_used[:, :, None], target_probs, dummy)
             ids = torch.where(draft_used, drafts, 0)
-        for probabilities in (draft_probs, target_probs):
-            slices = _sliced(probabilities)
-            entries = (torch.isfinite(slices) & (slices >= 0)).all(-1).all(-1)
-            mass = slices.sum(-1).sum(-1)
-            valid &= (entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)).all(-1)
+        if draft_source.device.type == "cuda":
+            batch, width, vocab = target_source.shape
+            blocks = triton.cdiv(vocab, _SCORE_BLOCK)
+            block_count = max(16, triton.next_power_of_2(blocks))
+            valid = valid.clone()
+            limits_arg = valid if token_limits is None else token_limits
+            limited = token_limits is not None
+            for probabilities, cols, limit_offset in (
+                (draft_source, width - 1, 1),
+                (target_source, width, 0),
+            ):
+                if cols > 0:
+                    block_valid = torch.empty((batch * cols, blocks), dtype=torch.int32, device=probabilities.device)
+                    block_mass = torch.empty((batch * cols, blocks), dtype=torch.float32, device=probabilities.device)
+                    torch.library.wrap_triton(_validate_probabilities_blocks)[(batch * cols, blocks)](
+                        probabilities, limits_arg, block_valid, block_mass,
+                        COLUMNS=cols, V=vocab, LIMITED=limited, LIMIT_OFFSET=limit_offset,
+                        BLOCK=_SCORE_BLOCK, BLOCKS=blocks, enable_fp_fusion=False,
+                    )
+                    torch.library.wrap_triton(_validate_probabilities_finish)[(batch,)](
+                        block_valid, block_mass, valid,
+                        COLUMNS=cols, BLOCKS=blocks, BLOCK_COUNT=block_count,
+                        enable_fp_fusion=False,
+                    )
+        else:
+            if token_limits is not None:
+                draft_probs = torch.where(draft_used[:, :, None], draft_probs, dummy)
+                target_probs = torch.where(target_used[:, :, None], target_probs, dummy)
+            for probabilities in (draft_probs, target_probs):
+                slices = _sliced(probabilities)
+                entries = (torch.isfinite(slices) & (slices >= 0)).all(-1).all(-1)
+                mass = slices.sum(-1).sum(-1)
+                valid &= (entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)).all(-1)
         out.valid.copy_(valid)
-        if disjoint or functional:
+        in_place = consume_inputs and draft_source.device.type == "cuda" and (disjoint or functional)
+        if in_place:
+            from .probability_mask import _MASK_BLOCK, _mask_invalid_probabilities
+            batch, width, vocab = target_source.shape
+            mask_blocks = triton.cdiv(vocab, _MASK_BLOCK)
+            limits_arg = out.valid if token_limits is None else token_limits
+            limited = token_limits is not None
+            if width > 1:
+                torch.library.wrap_triton(_mask_invalid_probabilities)[(batch * (width - 1), mask_blocks)](
+                    draft_source, out.valid, limits_arg, dummy,
+                    COLUMNS=width - 1, VOCAB=vocab, LIMITED=limited, LIMIT_OFFSET=1, BLOCK=_MASK_BLOCK,
+                )
+            torch.library.wrap_triton(_mask_invalid_probabilities)[(batch * width, mask_blocks)](
+                target_source, out.valid, limits_arg, dummy,
+                COLUMNS=width, VOCAB=vocab, LIMITED=limited, LIMIT_OFFSET=0, BLOCK=_MASK_BLOCK,
+            )
+            safe_draft_probs, safe_target_probs = draft_source, target_source
+        elif disjoint or functional:
             self.probability_masks[0].run_disjoint(draft_source, scratch["safe_draft_probs"],
                 out.valid, token_limits, dummy)
             self.probability_masks[1].run_disjoint(target_source, scratch["safe_target_probs"],
                 out.valid, token_limits, dummy)
+            safe_draft_probs, safe_target_probs = scratch["safe_draft_probs"], scratch["safe_target_probs"]
         else:
             if token_limits is not None:
                 for mask in self.probability_masks:
@@ -613,12 +707,13 @@ class PreparedStochasticVerification:
                 if token_limits is None:
                     mask.stage()
                 mask()
+            safe_draft_probs, safe_target_probs = scratch["safe_draft_probs"], scratch["safe_target_probs"]
         scratch["safe_ids"].copy_(torch.where(valid[:, None], ids, 0))
         scratch["seed_bits"].copy_(self.state.seed.view(torch.int64)[safe] ^ TARGET_RNG_DOMAIN)
         scratch["offset"].copy_(torch.where(self.rng.generation[safe] == generations, self.rng.target_offset[safe], 0))
         scratch["independent_accepted"].zero_()
         scratch["emitted_drafts"].zero_()
-        tokens, _, _ = verify_chain(scratch["safe_draft_probs"], scratch["safe_ids"], scratch["safe_target_probs"],
+        tokens, _, _ = verify_chain(safe_draft_probs, scratch["safe_ids"], safe_target_probs,
             scratch["independent_accepted"], scratch["emitted_drafts"], seed=scratch["seed_bits"], offset=scratch["offset"])
         accepted = scratch["emitted_drafts"]
         if token_limits is None:
@@ -635,8 +730,8 @@ class PreparedStochasticVerification:
         out.token_ids.masked_fill_(~valid[:, None], -1)
         if drafts.shape[1]:
             indices = scratch["safe_ids"].long().unsqueeze(-1)
-            draft = scratch["safe_draft_probs"].gather(-1, indices).squeeze(-1)
-            target = scratch["safe_target_probs"][:, :-1].gather(-1, indices).squeeze(-1)
+            draft = safe_draft_probs.gather(-1, indices).squeeze(-1)
+            target = safe_target_probs[:, :-1].gather(-1, indices).squeeze(-1)
             ratio = torch.where(draft > 0, (target / draft).clamp(max=1.), (target > 0).float())
             # Serial products preserve monotonicity despite FP32 rounding at unit ratios.
             prefixes = [ratio[:, 0]]

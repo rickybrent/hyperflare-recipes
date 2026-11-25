@@ -145,7 +145,7 @@ class PreparedCausalDraftRound:
         p = target.run(scratch["target"], logits.view(b, w, -1), candidates=drafts)
         target_valid = scratch["target"]["valid"]
         acceptance = verify.run(scratch["verify"], probabilities, p, target_valid,
-            drafts=drafts, draft_valid=valid, disjoint=True)
+            drafts=drafts, draft_valid=valid, disjoint=True, consume_inputs=True)
         committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=candidates)
         counts = committed.emitted_count
         if w > 1:

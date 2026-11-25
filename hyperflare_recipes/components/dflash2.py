@@ -11,7 +11,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, rotate_half
 
 from hyperflare_recipes.components.candidate_selector import PreparedCandidateSelector
 from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
-from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
+from hyperflare_recipes.components.embedding import PreparedEmbedding, PreparedShardedEmbedding
 from hyperflare_recipes.components.grouped_convolution import PreparedGroupedConvolution
 from hyperflare_recipes.components.linear import prepare_projection
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
@@ -334,9 +334,14 @@ class PreparedDraft:
         c = weights.config.draft
         s = (_draft_templates(weights.config.draft, weights.shard, scratch, embedding.device, examples=examples)
              if templates is None else templates)
-        self.embedding = PreparedShardedEmbedding(embedding, metadata.token_ids, s.local_embedding, s.embedding,
-            runtime=embedding_runtime, coordinator=coordinator, session=session, name=name + ".embedding",
-            num_rows=metadata.live_counts[:1]).functional(session=session, dynamic_inputs=True)
+        if embedding.shape[1] == s.embedding.shape[1]:
+            self.embedding = PreparedEmbedding(embedding, metadata.token_ids, s.embedding,
+                session=session, name=name + ".embedding",
+                num_rows=metadata.live_counts[:1]).functional(session=session, dynamic_inputs=True)
+        else:
+            self.embedding = PreparedShardedEmbedding(embedding, metadata.token_ids, s.local_embedding, s.embedding,
+                runtime=embedding_runtime, coordinator=coordinator, session=session, name=name + ".embedding",
+                num_rows=metadata.live_counts[:1]).functional(session=session, dynamic_inputs=True)
         self.layers = []
         for index, layer in enumerate(weights.draft.layers):
             prefix = f"{name}.layer{index}"

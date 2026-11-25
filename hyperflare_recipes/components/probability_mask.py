@@ -35,6 +35,29 @@ def _mask_probabilities(Source, Destination, Valid, Limits, Dummy,
         tl.store(Destination + offset, dummy, inside)
 
 
+@triton.jit
+def _mask_invalid_probabilities(
+    Probabilities, Valid, Limits, Dummy,
+    COLUMNS: tl.constexpr, VOCAB: tl.constexpr,
+    LIMITED: tl.constexpr, LIMIT_OFFSET: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row_col = tl.program_id(0)
+    row = row_col // COLUMNS
+    column = row_col % COLUMNS
+    valid = tl.load(Valid + row).to(tl.int1)
+    if LIMITED:
+        limit = tl.load(Limits + row)
+        valid = valid & (column < limit - LIMIT_OFFSET)
+    if valid:
+        return
+    block = tl.program_id(1)
+    token = block * BLOCK + tl.arange(0, BLOCK)
+    inside = token < VOCAB
+    offset = row_col.to(tl.int64) * VOCAB + token
+    dummy = tl.load(Dummy + token, inside, other=0.)
+    tl.store(Probabilities + offset, dummy, inside)
+
+
 class PreparedProbabilityMask:
     """Copy admitted columns and fill all others with a valid dummy distribution.
 

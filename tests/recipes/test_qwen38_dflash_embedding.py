@@ -18,13 +18,13 @@ def _table():
 
 @pytest.mark.parametrize("world_size", [1, 2, 4])
 def test_every_rank_binds_one_draft_embedding_signature(world_size):
-    table, columns = _table(), 2560 // world_size
+    table = _table()
     signatures = set()
     for rank in range(world_size):
         embedding = draft_embedding(table, TensorParallelShard(rank, world_size))
-        assert embedding.shape == (16, columns)
+        assert embedding.shape == table.shape
         assert embedding.storage_offset() == 0
-        assert torch.equal(embedding, table[:, rank * columns:(rank + 1) * columns])
+        assert embedding.data_ptr() == table.data_ptr()
         signatures.add(_signature((embedding,)))
     assert len(signatures) == 1
 

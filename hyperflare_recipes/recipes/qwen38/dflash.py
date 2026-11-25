@@ -39,15 +39,9 @@ class CaptureMetadata:
 
 
 def draft_embedding(embedding, shard):
-    """Return this rank's draft embedding columns in storage that starts at offset zero.
-
-    Tensor-parallel ranks bind one compiled forward whose input bindings include storage
-    offsets. A column view of the replicated target table starts at a rank-dependent offset,
-    so tensor-parallel ranks receive a contiguous copy of their columns. One rank uses the
-    target table directly.
-    """
-    first, last = shard.partition(embedding.shape[1], alignment=64)
-    return embedding[:, first:last].contiguous()
+    """Reuse the replicated target embedding table directly without sharding or AllGather."""
+    del shard
+    return embedding
 
 
 class PreparedTargetState:
