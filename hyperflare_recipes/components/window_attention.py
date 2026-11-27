@@ -130,6 +130,130 @@ def commit_circular_kv(key, value, history_key, history_value, metadata, counts=
     )
 
 
+@triton.jit
+def _stage_circular_kv(
+    HistoryKeys,
+    HistoryValues,
+    Keys,
+    Values,
+    OutputKeys,
+    OutputValues,
+    Starts,
+    Begins,
+    Lengths,
+    Counts,
+    StateRows,
+    HKS: tl.constexpr,
+    HVS: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    WINDOW: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    FIRST_POSITION: tl.constexpr,
+    CLAMP_FP8: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request, slot_offset = tl.program_id(0), tl.program_id(1)
+    dim = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    dim_mask = dim < WIDTH
+    start = tl.load(Starts + request).to(tl.int64)
+    length = tl.load(Lengths + request).to(tl.int64)
+    count = tl.load(Counts + request).to(tl.int64)
+    begin = tl.load(Begins + request).to(tl.int64)
+    state = tl.load(StateRows + request).to(tl.int64)
+    first = tl.maximum(start - WINDOW, FIRST_POSITION)
+    pos = first + slot_offset
+    valid = (length > 0) & (pos < start + count) & dim_mask
+    from_history = valid & (pos < start) & (state > 0)
+    from_current = valid & (pos >= start)
+    ring_slot = pos % WINDOW
+    src_row = begin + (pos - start)
+    k_hist = tl.load(HistoryKeys + state * HKS + ring_slot * WIDTH + dim, from_history, other=0.0).to(tl.bfloat16)
+    v_hist = tl.load(HistoryValues + state * HVS + ring_slot * WIDTH + dim, from_history, other=0.0).to(tl.bfloat16)
+    k_cur = tl.load(Keys + src_row * KS + dim, from_current, other=0.0).to(tl.bfloat16)
+    v_cur = tl.load(Values + src_row * VS + dim, from_current, other=0.0).to(tl.bfloat16)
+    k_out = tl.where(from_history, k_hist, tl.where(from_current, k_cur, 0.0))
+    v_out = tl.where(from_history, v_hist, tl.where(from_current, v_cur, 0.0))
+    if CLAMP_FP8:
+        k_out = tl.clamp(k_out.to(tl.float32), -448.0, 448.0)
+        v_out = tl.clamp(v_out.to(tl.float32), -448.0, 448.0)
+    out_row = request.to(tl.int64) * CAPACITY + slot_offset.to(tl.int64)
+    tl.store(OutputKeys + out_row * WIDTH + dim, k_out, dim_mask)
+    tl.store(OutputValues + out_row * WIDTH + dim, v_out, dim_mask)
+
+
+def stage_circular_kv(
+    history_key,
+    history_value,
+    key,
+    value,
+    output_key,
+    output_value,
+    metadata,
+    *,
+    counts=None,
+    first_position: int = 0,
+):
+    """Batched circular KV staging into contiguous paged BF16 or FP8 buffers."""
+    if (
+        key.ndim != 3
+        or value.shape != key.shape
+        or history_key.ndim != 4
+        or history_value.shape != history_key.shape
+        or output_key.ndim != 4
+        or output_value.shape != output_key.shape
+    ):
+        raise ValueError("circular KV staging requires 3D candidates and 4D history/output tensors")
+    if (
+        history_key.shape[2:] != key.shape[1:]
+        or output_key.shape[2:] != key.shape[1:]
+        or history_key.dtype != history_value.dtype
+        or output_key.dtype != output_value.dtype
+        or output_key.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+    ):
+        raise ValueError("circular KV staging requires matching head geometry and BF16/FP8 dtypes")
+    rows = metadata.starts.numel()
+    total_slots = output_key.shape[0] * output_key.shape[1]
+    if rows <= 0 or total_slots % rows != 0:
+        raise ValueError("circular KV staging output slots must be divisible by request capacity")
+    capacity = total_slots // rows
+    counts = metadata.lengths if counts is None else counts
+    flat_k, flat_v = key.reshape(key.shape[0], -1), value.reshape(value.shape[0], -1)
+    flat_out_k = output_key.reshape(total_slots, -1)
+    flat_out_v = output_value.reshape(total_slots, -1)
+    width = flat_k.shape[1]
+    window = history_key.shape[1]
+    if history_key.stride(1) != width or history_value.stride(1) != width:
+        raise ValueError("circular KV history slots must be contiguous along (kv_heads, head_dim)")
+    clamp_fp8 = output_key.dtype == torch.float8_e4m3fn
+    torch.library.wrap_triton(_stage_circular_kv)[
+        (rows, capacity, triton.cdiv(width, 256))
+    ](
+        history_key,
+        history_value,
+        flat_k,
+        flat_v,
+        flat_out_k,
+        flat_out_v,
+        metadata.starts,
+        metadata.query_start_loc,
+        metadata.lengths,
+        counts,
+        metadata.state_rows,
+        history_key.stride(0),
+        history_value.stride(0),
+        flat_k.stride(0),
+        flat_v.stride(0),
+        width,
+        window,
+        capacity,
+        first_position,
+        clamp_fp8,
+        256,
+    )
+
+
 @dataclass(frozen=True)
 class Query:
     operands: tuple

@@ -752,3 +752,40 @@ def test_gemma4_multi_rank_and_speculative_adapter(monkeypatch, tmp_path):
     assert config.speculative_widths == (1, 2, 3, 4, 5, 6)
     assert ranks is rendezvous and checkpoint == model.checkpoint
 
+
+def test_bf16_kv_rank_costs_and_parameters():
+    """Verify --kv-cache-dtype bf16 adjusts RankCosts byte-accurately across all Gemma 4 variants."""
+    from hyperflare_recipes.components.parallel import TensorParallelShard
+    from hyperflare_recipes.recipes.gemma4.pool import continuation_layout, page_bytes
+    from hyperflare_recipes.recipes.gemma4.recipe import KvCachePrecisionParameters
+
+    variants = (
+        ("gemma-4-e2b", _e2b_raw()),
+        ("gemma-4-e4b", _e4b_raw()),
+        ("gemma-4-12b", _gemma4_12b_raw()),
+        ("gemma-4-26b-a4b", _moe_26b_raw()),
+        ("gemma-4-31b", _dense_31b_raw()),
+    )
+    for alias, raw in variants:
+        model = resolve(alias)
+        assert model.recipe.parameters.kv_cache.dtype == "fp8"
+        cfg = ModelConfig.from_dict(raw)
+        for tp in (1, 2, 4):
+            shard = TensorParallelShard(0, tp)
+            gpus = tuple(
+                planning.Gpu(i, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{i}", 96 << 30, 95 << 30, (12, 0))
+                for i in range(tp)
+            )
+            bf16_params = replace(
+                model.recipe.parameters,
+                max_concurrency=4,
+                speculation=None,
+                kv_cache=KvCachePrecisionParameters(dtype="bf16"),
+            )
+            plan = planning.fit(model.recipe, model.checkpoint, gpus, parameters=bf16_params, reserve_bytes=0)
+            expected_row = continuation_layout(cfg, shard, kv_dtype=torch.bfloat16).row_bytes
+            expected_page = page_bytes(cfg, shard, kv_dtype=torch.bfloat16)
+            assert plan.costs.state_row_bytes == expected_row, f"{alias} TP{tp} row mismatch"
+            assert plan.costs.page_bytes == expected_page, f"{alias} TP{tp} page mismatch"
+            assert plan.to_dict()["kv_cache_dtype"] == "bf16"
+

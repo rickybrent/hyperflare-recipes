@@ -13,7 +13,7 @@ import torch
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention
 from hyperflare_recipes.components.paged_batch import Metadata
 from hyperflare_recipes.components.parallel import TensorParallelShard
-from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv
+from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv, stage_circular_kv
 from hyperflare_recipes.components.window_staging import PreparedWindowStaging
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.scratch import ScratchArena
@@ -321,3 +321,148 @@ def test_kv_shared_donor_sliding_layer_parity_across_wraparound():
                         g = h // gqa
                         exp = (q_t[tok, h].float() @ ks[:, g].T).softmax(-1) @ vs[:, g]
                         torch.testing.assert_close(act[tok, h].float(), exp, atol=0.02, rtol=0.03)
+
+
+@CUDA
+@torch.no_grad()
+def test_bf16_sliding_prefill_staging_and_decode_verify_wraparound_parity():
+    """Verify full BF16 sliding-window path: stage_circular_kv + scaled BF16 prefill + commit + decode/verify/Assistant."""
+    torch.manual_seed(404)
+    device = torch.device("cuda:0")
+    heads, groups, dim, window = 8, 2, 256, 1024
+    total_prefill = 1520
+    chunks = [(0, 600), (600, 600), (1200, 320)]
+    total_tokens = total_prefill + 10
+
+    q_all = (torch.randn(total_tokens, heads, dim, device=device) * 0.1).bfloat16()
+    k_all = (torch.randn(total_tokens, groups, dim, device=device) * 0.1).bfloat16()
+    v_all = (torch.randn(total_tokens, groups, dim, device=device) * 0.2).bfloat16()
+    # Values > 448 verify BF16 circular commit does NOT clamp to FP8 range.
+    k_all[1200, 0, 0] = 600.0
+
+    hk = torch.zeros((3, window, groups, dim), dtype=torch.bfloat16, device=device)
+    hv = torch.zeros((3, window, groups, dim), dtype=torch.bfloat16, device=device)
+
+    for start, length in chunks:
+        pages = (length + window + PAGE_TOKENS - 1) // PAGE_TOKENS
+        staged_k = torch.empty((pages, PAGE_TOKENS, groups, dim), dtype=torch.bfloat16, device=device)
+        staged_v = torch.empty((pages, PAGE_TOKENS, groups, dim), dtype=torch.bfloat16, device=device)
+        staged_pages = torch.arange(pages, dtype=torch.int32, device=device).view(1, -1)
+        m = Metadata.allocate(length, 1, 16, device, samples=length)
+        m.set(
+            torch.tensor([start], dtype=torch.int64, device=device),
+            torch.tensor([length], dtype=torch.int32, device=device),
+            torch.tensor([1], dtype=torch.int64, device=device),
+            m.page_table,
+            torch.zeros(1, length, dtype=torch.int64, device=device),
+            torch.tensor([1], dtype=torch.int32, device=device),
+        )
+        staged_lengths = torch.tensor([min(start, window) + length], dtype=torch.int32, device=device)
+        out = torch.empty((length, heads, dim), dtype=torch.bfloat16, device=device)
+        q_c = q_all[start : start + length].contiguous()
+        k_c = k_all[start : start + length].contiguous()
+        v_c = v_all[start : start + length].contiguous()
+        q_scaled = (q_c * math.sqrt(dim)).contiguous()
+        arena = ScratchArena(device)
+        with RecordedPreparationSession(
+            device=device, checkpoint=f"g4-bf16-pf-{start}", workload_schema="g4-bf16-pf", numerical_policy="default"
+        ) as session:
+            session.register_scratch(arena)
+            at_op = PreparedPagedAttention(
+                q_scaled, staged_k, staged_v, staged_pages, staged_lengths, m.query_start_loc, out,
+                mode="prefill", window=window - 1, width=1, k_descale=None, v_descale=None,
+                session=session, workspace=arena, name="attn_bf16", tuning_page_count=pages,
+            ).functional(session=session, k_cache=None, v_cache=None, page_table=None, cache_seqlens=None, cu_seqlens_q=None)
+            session.tune()
+            arena.release_preparation()
+            stage_circular_kv(hk, hv, k_c, v_c, staged_k, staged_v, m)
+            actual = at_op(q_scaled, k_cache=staged_k, v_cache=staged_v, page_table=staged_pages, cache_seqlens=staged_lengths, cu_seqlens_q=m.query_start_loc)
+            commit_circular_kv(k_c, v_c, hk, hv, m, m.lengths)
+            torch.cuda.synchronize()
+            ref = _ref_sliding_unit_scale(q_c, k_all, v_all, m.positions, window)
+            torch.testing.assert_close(actual.float(), ref, atol=1e-2, rtol=1e-2)
+
+    assert float(hk[1, 1200 % window, 0, 0]) == 600.0
+
+    # Verify BF16 circular history decode after wraparound via PreparedWindowAttention(softmax_scale=1.0).
+    pos_next = total_prefill
+    m_dec = Metadata.allocate(1, 1, 16, device, samples=1)
+    m_dec.set(
+        torch.tensor([pos_next], dtype=torch.int64, device=device),
+        torch.tensor([1], dtype=torch.int32, device=device),
+        torch.tensor([1], dtype=torch.int64, device=device),
+        m_dec.page_table,
+        torch.zeros(1, 1, dtype=torch.int64, device=device),
+        torch.tensor([1], dtype=torch.int32, device=device),
+    )
+    q_dec = q_all[pos_next : pos_next + 1].contiguous()
+    k_dec = k_all[pos_next : pos_next + 1].contiguous()
+    v_dec = v_all[pos_next : pos_next + 1].contiguous()
+    out_dec = torch.empty_like(q_dec)
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="g4-bf16-dec", workload_schema="g4-bf16-dec", numerical_policy="default") as session:
+        session.register_scratch(arena)
+        op_dec = PreparedWindowAttention(
+            q_dec, k_dec, v_dec, hk, hv, m_dec, out_dec, softmax_scale=1.0,
+            session=session, workspace=arena, name="dec_win_bf16",
+        ).functional(session=session)
+        session.tune()
+        arena.release_preparation()
+        actual_dec = op_dec(q_dec, k_dec, v_dec, m_dec)
+        torch.cuda.synchronize()
+        ref_dec = _ref_sliding_unit_scale(q_dec, k_all, v_all, m_dec.positions, window)
+        torch.testing.assert_close(actual_dec.float(), ref_dec, atol=1e-2, rtol=1e-2)
+
+
+@CUDA
+@torch.no_grad()
+def test_bf16_global_prefill_and_kv_write_parity():
+    """Verify BF16 global 512-dim K + split 256+256 V paged KV write and unit-scale prefill attention."""
+    from hyperflare_recipes.components.paged_attention import PreparedPagedKVWriter
+
+    torch.manual_seed(505)
+    device = torch.device("cuda:0")
+    heads, groups, dim, half_dim, tokens = 16, 4, 512, 256, 256
+    q = (torch.randn(tokens, heads, dim, device=device) * 0.1).bfloat16()
+    k = (torch.randn(tokens, groups, dim, device=device) * 0.1).bfloat16()
+    v = (torch.randn(tokens, groups, dim, device=device) * 0.2).bfloat16()
+    v_lo, v_hi = v[:, :, :half_dim].contiguous(), v[:, :, half_dim:].contiguous()
+
+    k_cache = torch.zeros((4, PAGE_TOKENS, groups, dim), dtype=torch.bfloat16, device=device)
+    v_lo_cache = torch.zeros((4, PAGE_TOKENS, groups, half_dim), dtype=torch.bfloat16, device=device)
+    v_hi_cache = torch.zeros((4, PAGE_TOKENS, groups, half_dim), dtype=torch.bfloat16, device=device)
+    slots = torch.arange(tokens, dtype=torch.int64, device=device)
+    page_table = torch.arange(4, dtype=torch.int32, device=device).view(1, 4)
+    lengths = torch.tensor([tokens], dtype=torch.int32, device=device)
+    cu = torch.tensor([0, tokens], dtype=torch.int32, device=device)
+    q_scaled = (q * math.sqrt(dim)).contiguous()
+    out_lo = torch.empty((tokens, heads, half_dim), dtype=torch.bfloat16, device=device)
+    out_hi = torch.empty((tokens, heads, half_dim), dtype=torch.bfloat16, device=device)
+
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="g4-bf16-global", workload_schema="g4-bf16-global", numerical_policy="default") as session:
+        session.register_scratch(arena)
+        w_v = PreparedPagedKVWriter(v_lo, v_hi, v_lo_cache, v_hi_cache, slots, session=session, name="wv", caller_owned_placeholders=True).functional()
+        w_k = PreparedPagedKVWriter(k, v_hi, k_cache, v_hi_cache, slots, session=session, name="wk", caller_owned_placeholders=True).functional()
+        a_lo = PreparedPagedAttention(q_scaled, k_cache, v_lo_cache, page_table, lengths, cu, out_lo, mode="prefill", window=-1, width=1, session=session, workspace=arena, name="alo", caller_owned_placeholders=True, tuning_page_count=4).functional(session=session, page_table=None, cache_seqlens=None, cu_seqlens_q=None)
+        a_hi = PreparedPagedAttention(q_scaled, k_cache, v_hi_cache, page_table, lengths, cu, out_hi, mode="prefill", window=-1, width=1, session=session, workspace=arena, name="ahi", caller_owned_placeholders=True, tuning_page_count=4).functional(session=session, page_table=None, cache_seqlens=None, cu_seqlens_q=None)
+        session.tune()
+        arena.release_preparation()
+        w_v(v_lo, v_hi, slots)
+        w_k(k, v_hi, slots)
+        actual = torch.cat(
+            (
+                a_lo(q_scaled, page_table=page_table, cache_seqlens=lengths, cu_seqlens_q=cu),
+                a_hi(q_scaled, page_table=page_table, cache_seqlens=lengths, cu_seqlens_q=cu),
+            ),
+            dim=-1,
+        )
+        torch.cuda.synchronize()
+
+    qf = q.float().transpose(0, 1)
+    kf = k.float().transpose(0, 1).repeat_interleave(heads // groups, dim=0)
+    vf = v.float().transpose(0, 1).repeat_interleave(heads // groups, dim=0)
+    mask = torch.triu(torch.ones((tokens, tokens), device=device, dtype=torch.bool), diagonal=1)
+    scores = (qf @ kf.transpose(-2, -1)).masked_fill(mask, float("-inf"))
+    ref = (torch.softmax(scores, dim=-1) @ vf).transpose(0, 1)
+    torch.testing.assert_close(actual.float(), ref, atol=1e-2, rtol=1e-2)

@@ -4,8 +4,9 @@
 
 """Gemma 4 text preparation across dense, MoE, and Assistant MTP checkpoints."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any, ClassVar
 
 from ignition.declaration import (
     Checkpoint,
@@ -15,21 +16,18 @@ from ignition.declaration import (
     SamplingDefaults,
 )
 from ignition.parameters import (
+    ParameterContext,
+    ParameterGroup,
+    ParameterScope,
     PromptLogprobsParameters,
     RecipeParameters,
     SpeculationParameters,
     VisionParameters,
+    param,
 )
 from ignition.preparation.bootstrap import common_preparation_kwargs
 
 from hyperflare_recipes.parameters import NativeDenseActivationsParameters
-
-
-@dataclass(frozen=True)
-class Gemma4Parameters(RecipeParameters):
-    """Preparation parameters for Gemma 4 checkpoints."""
-
-    native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
 
 
 _GRAPH_BYTES = 4 << 30
@@ -48,6 +46,60 @@ _E4B_RANKS = _ranks((11_539_712, 1_048_576), (5_772_544, 524_288), (5_772_544, 5
 _12B_RANKS = _ranks((168_828_672, 1_048_576), (84_942_592, 1_048_576), (42_999_552, 1_048_576))
 _26B_RANKS = _ranks((106_174_208, 1_310_720), (53_090_048, 655_360), (26_875_648, 655_360))
 _31B_RANKS = _ranks((424_684_288, 5_242_880), (212_347_648, 2_621_440), (106_179_328, 1_310_720))
+
+_E2B_BF16_RANKS = _ranks((7_081_216, 786_432), (7_081_216, 786_432), (7_081_216, 786_432))
+_E4B_BF16_RANKS = _ranks((23_074_048, 2_097_152), (11_539_712, 1_048_576), (11_539_712, 1_048_576))
+_12B_BF16_RANKS = _ranks((337_649_408, 2_097_152), (169_877_248, 2_097_152), (85_991_168, 2_097_152))
+_26B_BF16_RANKS = _ranks((212_342_528, 2_621_440), (106_174_208, 1_310_720), (53_745_408, 1_310_720))
+_31B_BF16_RANKS = _ranks((849_357_568, 10_485_760), (424_684_288, 5_242_880), (212_347_648, 2_621_440))
+
+_FP8_TO_BF16_COSTS = {
+    (fp8[tp].state_row_bytes, fp8[tp].page_bytes): (bf16[tp].state_row_bytes, bf16[tp].page_bytes)
+    for fp8, bf16 in (
+        (_E2B_RANKS, _E2B_BF16_RANKS),
+        (_E4B_RANKS, _E4B_BF16_RANKS),
+        (_12B_RANKS, _12B_BF16_RANKS),
+        (_26B_RANKS, _26B_BF16_RANKS),
+        (_31B_RANKS, _31B_BF16_RANKS),
+    )
+    for tp in (1, 2, 4)
+}
+
+
+@dataclass(frozen=True)
+class KvCachePrecisionParameters(ParameterGroup):
+    """KV cache storage precision for Gemma 4 circular sliding and paged global layers."""
+
+    default_group: ClassVar[str | None] = "capacity and compression"
+
+    dtype: str = param(
+        "fp8",
+        flag="--kv-cache-dtype",
+        metavar="DTYPE",
+        choices=("fp8", "bf16"),
+        manifest_key="kv_cache_dtype",
+        dict_key="kv_cache_dtype",
+        scope=ParameterScope.DEPLOYMENT,
+        help="KV cache storage precision: fp8 (FP8 E4M3, 2x KV capacity) or bf16 (lossless BF16 KV)",
+        status_label=lambda v: "BF16 KV" if v == "bf16" else None,
+    )
+
+    def adjust_rank_costs(self, costs: Any, context: ParameterContext) -> Any:
+        costs = super().adjust_rank_costs(costs, context)
+        if self.dtype != "bf16":
+            return costs
+        mapped = _FP8_TO_BF16_COSTS.get((costs.state_row_bytes, costs.page_bytes))
+        if mapped is not None:
+            return replace(costs, state_row_bytes=mapped[0], page_bytes=mapped[1])
+        return replace(costs, state_row_bytes=costs.state_row_bytes * 2, page_bytes=costs.page_bytes * 2)
+
+
+@dataclass(frozen=True)
+class Gemma4Parameters(RecipeParameters):
+    """Preparation parameters for Gemma 4 checkpoints."""
+
+    native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
+    kv_cache: KvCachePrecisionParameters = KvCachePrecisionParameters()
 
 
 def _assistant_for(snapshot, checkpoint):
