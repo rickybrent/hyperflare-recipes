@@ -12,7 +12,7 @@ from hyperflare_recipes.components.linear import QuantizedProjection, Unquantize
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
-from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv
+from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv, stage_circular_kv
 from hyperflare_recipes.components.window_staging import PreparedWindowStaging
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
@@ -157,8 +157,12 @@ class PreparedAttention:
 
         self.staging = None
         self.staged_pages = None
+        self.staged_shape = None
         self.history_key = None
         self.history_value = None
+        self.kv_dtype = getattr(pool, "kv_dtype", torch.float8_e4m3fn)
+        is_bf16_kv = self.kv_dtype == torch.bfloat16
+        self.prefill_query_scale = math.sqrt(self.dim) if is_bf16_kv else None
         if self.is_sliding:
             history_key, history_value = pool.attention(layer, config, shard=shard)
             self.history_key, self.history_value = history_key, history_value
@@ -167,25 +171,27 @@ class PreparedAttention:
                 from .config import PAGE_TOKENS
 
                 pages = (tokens + self.window + PAGE_TOKENS - 1) // PAGE_TOKENS
-                self.staged_key = zeros("staged_key", (pages, PAGE_TOKENS, self.kv_heads, self.dim), dtype=torch.float8_e4m3fn)
-                self.staged_value = zeros("staged_value", (pages, PAGE_TOKENS, self.kv_heads, self.dim), dtype=torch.float8_e4m3fn)
+                self.staged_shape = (pages, PAGE_TOKENS, self.kv_heads, self.dim)
+                self.staged_key = zeros("staged_key", self.staged_shape, dtype=self.kv_dtype)
+                self.staged_value = zeros("staged_value", self.staged_shape, dtype=self.kv_dtype)
                 self.staged_lengths = zeros("staged_lengths", (batch,), dtype=torch.int32)
                 self.staged_pages = persistent_copy(
                     torch.arange(pages, dtype=torch.int32, device=source.device).view(batch, -1)
                 )
                 if not self.shared_kv:
                     self.value = zeros("value", (tokens, self.kv_heads, self.dim))
-                    self.staging = PreparedWindowStaging(
-                        history_key,
-                        history_value,
-                        self.key,
-                        self.value,
-                        self.staged_key,
-                        self.staged_value,
-                        metadata,
-                        session=session,
-                        name=name + ".window_stage",
-                    )
+                    if not is_bf16_kv:
+                        self.staging = PreparedWindowStaging(
+                            history_key,
+                            history_value,
+                            self.key,
+                            self.value,
+                            self.staged_key,
+                            self.staged_value,
+                            metadata,
+                            session=session,
+                            name=name + ".window_stage",
+                        )
                 self.attention = PreparedPagedAttention(
                     self.q,
                     self.staged_key,
@@ -202,8 +208,8 @@ class PreparedAttention:
                     workspace=workspace,
                     caller_owned_placeholders=True,
                     tuning_page_count=pages,
-                    k_descale=k_descale,
-                    v_descale=unit_scale,
+                    k_descale=None if is_bf16_kv else k_descale,
+                    v_descale=None if is_bf16_kv else unit_scale,
                 )
             else:
                 if not self.shared_kv:
@@ -242,8 +248,8 @@ class PreparedAttention:
                     cache_metadata.slots,
                     session=session,
                     name=name + ".cache_write_v",
-                    k_scale=unit_scale,
-                    v_scale=unit_scale,
+                    k_scale=None if is_bf16_kv else unit_scale,
+                    v_scale=None if is_bf16_kv else unit_scale,
                     caller_owned_placeholders=True,
                 )
                 self.writer_k = PreparedPagedKVWriter(
@@ -254,8 +260,8 @@ class PreparedAttention:
                     cache_metadata.slots,
                     session=session,
                     name=name + ".cache_write_k",
-                    k_scale=unit_scale,
-                    v_scale=unit_scale,
+                    k_scale=None if is_bf16_kv else unit_scale,
+                    v_scale=None if is_bf16_kv else unit_scale,
                     caller_owned_placeholders=True,
                 )
             self.attended_lo_full = zeros("attended_lo_full", (q_cap, self.heads, half_dim))
@@ -278,8 +284,8 @@ class PreparedAttention:
                 workspace=workspace,
                 caller_owned_placeholders=True,
                 tuning_page_count=int(pool.memory_capacity[1].item()),
-                k_descale=k_descale,
-                v_descale=unit_scale,
+                k_descale=None if is_bf16_kv else k_descale,
+                v_descale=None if is_bf16_kv else unit_scale,
             )
             self.attention_hi = PreparedPagedAttention(
                 self.q_full,
@@ -297,8 +303,8 @@ class PreparedAttention:
                 workspace=workspace,
                 caller_owned_placeholders=True,
                 tuning_page_count=int(pool.memory_capacity[1].item()),
-                k_descale=k_descale,
-                v_descale=unit_scale,
+                k_descale=None if is_bf16_kv else k_descale,
+                v_descale=None if is_bf16_kv else unit_scale,
             )
 
         self.q_cap = q_cap
@@ -349,14 +355,28 @@ class PreparedAttention:
                     k = rms_norm(k_raw.view(tokens, self.kv_heads, self.dim), self.k_norm, self.eps)
                     key = apply_rotary_pos_emb(k, cos, sin)
                     value = rms_norm_no_scale(v_raw.view(tokens, self.kv_heads, self.dim), self.eps)
-                    staged_key, staged_value = self.staging(key, value, metadata=metadata)
+                    if self.staging is not None:
+                        staged_key, staged_value = self.staging(key, value, metadata=metadata)
+                    else:
+                        staged_key = torch.empty(self.staged_shape, dtype=self.kv_dtype, device=key.device)
+                        staged_value = torch.empty(self.staged_shape, dtype=self.kv_dtype, device=value.device)
+                        stage_circular_kv(
+                            self.history_key,
+                            self.history_value,
+                            key,
+                            value,
+                            staged_key,
+                            staged_value,
+                            metadata,
+                        )
                 else:
                     staged_key, staged_value = sliding_donor[0], sliding_donor[1]
                 staged_lengths = torch.where(
                     metadata.lengths > 0, metadata.starts.clamp(max=self.window).int() + metadata.lengths, 0
                 )
+                paged_query = query if self.prefill_query_scale is None else query * self.prefill_query_scale
                 attended = self.attention(
-                    query,
+                    paged_query,
                     k_cache=staged_key,
                     v_cache=staged_value,
                     page_table=self.staged_pages,
@@ -401,7 +421,8 @@ class PreparedAttention:
         arguments = dict(page_table=metadata.page_table, cache_seqlens=cache_metadata.lengths,
                          cu_seqlens_q=metadata.query_start_loc)
         full_query = torch.zeros((self.q_cap, self.heads, self.dim), dtype=query.dtype, device=query.device)
-        full_query[:tokens].copy_(query)
+        paged_query = query if self.prefill_query_scale is None else query * self.prefill_query_scale
+        full_query[:tokens].copy_(paged_query)
         lo = self.attention_lo(full_query, **arguments)[:tokens]
         hi = self.attention_hi(full_query, **arguments)[:tokens]
         attended = torch.cat((lo, hi), dim=-1)

@@ -56,7 +56,7 @@ from .frontend import chat_template_asset
 from .config import PAGE_TOKENS
 from .contract import prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch, SoftcappedResume
-from .pool import ContinuationPool, continuation_layout, page_bytes
+from .pool import ContinuationPool, continuation_layout, page_bytes, resolve_kv_dtype
 from .speculative import PreparedContext, PreparedRound
 from .weights import ModelWeights
 from .recipe import Gemma4Parameters, RECIPE
@@ -80,6 +80,14 @@ class PreparationConfig(BasePreparationConfig):
     @property
     def native_dense_activations(self) -> bool:
         return self.parameters.native_dense_activations.enabled
+
+    @property
+    def kv_cache_dtype(self) -> str:
+        return self.parameters.kv_cache.dtype
+
+    @property
+    def kv_dtype(self) -> torch.dtype:
+        return resolve_kv_dtype(self.kv_cache_dtype)
 
     @property
     def speculative_shapes(self):
@@ -187,7 +195,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
     effective_context = (effective_context // PAGE_TOKENS) * PAGE_TOKENS
     if config.prefill_chunk_size > effective_context:
         raise ValueError("Gemma 4 prefill chunk size exceeds the checkpoint's max_position_embeddings")
-    layout = continuation_layout(weights.config, shard)
+    kv_dtype = config.kv_dtype
+    layout = continuation_layout(weights.config, shard, kv_dtype=kv_dtype)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
     if core_storage is None:
         snapshots = min(snapshots, 256)
@@ -201,7 +210,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
     # Development serving keeps this bounded cache; exported cores size KV from the serving host's memory.
     pages = max(prep_pages, config.minimum_pages)
     initial_pages = prep_pages if core_storage is not None else pages
-    bytes_per_page = page_bytes(weights.config, shard)
+    bytes_per_page = page_bytes(weights.config, shard, kv_dtype=kv_dtype)
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.for_model(
@@ -210,6 +219,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             initial_pages,
             device,
             shard=shard,
+            kv_dtype=kv_dtype,
             storage=core_storage,
             maximum_pages=max(pages, total_memory // bytes_per_page),
             maximum_rows=total_memory // layout.row_bytes,
@@ -272,6 +282,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                     "headers": [s.header_sha256 for s in manifest.shards],
                     "world_size": shard.world_size,
                     "sliding_storage": "circular",
+                    "kv_dtype": config.kv_cache_dtype,
                     "contract": "gemma4.graph-inputs.v1",
                 },
                 sort_keys=True,
