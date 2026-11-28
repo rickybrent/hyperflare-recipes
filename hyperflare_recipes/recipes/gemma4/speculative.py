@@ -437,9 +437,11 @@ class PreparedRound:
                           for name, (shape, dtype) in target.layout.items()}
         target.run(target_scratch, logits.view(b, w, -1), candidates=drafts)
         verify_scratch = {name: torch.empty(shape, dtype=dtype, device=slots.device)
-                          for name, (shape, dtype) in verify.layout.items()}
+                          for name, (shape, dtype) in PreparedStochasticVerification.scratch_layout(
+                              b, w, self.requests.vocab_size, consume_inputs=True).items()}
         acceptance = verify.run(verify_scratch, probabilities, target_scratch["probabilities"],
-                                target_scratch["valid"], disjoint=True, drafts=drafts, draft_valid=valid)
+                                target_scratch["valid"], disjoint=True, consume_inputs=True,
+                                drafts=drafts, draft_valid=valid)
         committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=candidates)
         counts = committed.emitted_count
         if deferred_sliding:

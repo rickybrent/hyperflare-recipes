@@ -13,16 +13,9 @@ from hyperflare_recipes.components.linear import QuantizedProjection, Unquantize
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
-<<<<<<< HEAD
-<<<<<<< HEAD
-from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv
-=======
-from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv, stage_circular_kv
->>>>>>> 39a61a7 (Add --kv-cache-dtype bf16 support for Gemma 4 circular sliding and paged global KV)
-from hyperflare_recipes.components.window_staging import PreparedWindowStaging
-=======
 from hyperflare_recipes.components.wide_paged_decode import PreparedWidePagedDecode
->>>>>>> 53bc07f (Add split-KV paged decode and verify attention for 512-dim global heads)
+from hyperflare_recipes.components.window_attention import PreparedWindowAttention, commit_circular_kv, stage_circular_kv
+from hyperflare_recipes.components.window_staging import PreparedWindowStaging
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 
